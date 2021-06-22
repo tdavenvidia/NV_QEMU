@@ -190,6 +190,7 @@ struct SMMUState {
 
     /* Nested SMMU */
     bool nested;
+    bool has_cmdqv;
     SMMUViommu *viommu;
     QemuThread event_thread_id;
 
