@@ -74,6 +74,10 @@ struct IOMMUFDViommu *iommufd_backend_alloc_viommu(IOMMUFDBackend *be,
                                                    uint32_t dev_id,
                                                    uint32_t viommu_type,
                                                    uint32_t hwpt_id);
+int iommufd_viommu_set_vdev_id(IOMMUFDViommu *viommu, uint32_t dev_id,
+                               uint64_t vdev_id);
+int iommufd_viommu_unset_vdev_id(IOMMUFDViommu *viommu, uint32_t dev_id,
+                                 uint64_t vdev_id);
 
 #define TYPE_HOST_IOMMU_DEVICE_IOMMUFD TYPE_HOST_IOMMU_DEVICE "-iommufd"
 OBJECT_DECLARE_TYPE(HostIOMMUDeviceIOMMUFD, HostIOMMUDeviceIOMMUFDClass,

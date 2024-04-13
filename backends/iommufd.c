@@ -379,6 +379,52 @@ struct IOMMUFDViommu *iommufd_backend_alloc_viommu(IOMMUFDBackend *be,
     return viommu;
 }
 
+int iommufd_viommu_set_vdev_id(IOMMUFDViommu *viommu, uint32_t dev_id,
+                               uint64_t vdev_id)
+{
+    int ret, fd = viommu->iommufd->fd;
+    struct iommu_viommu_set_vdev_id set_vdev_id = {
+        .size = sizeof(set_vdev_id),
+        .viommu_id = viommu->viommu_id,
+        .dev_id = dev_id,
+        .vdev_id = vdev_id,
+    };
+
+    ret = ioctl(fd, IOMMU_VIOMMU_SET_VDEV_ID, &set_vdev_id);
+    if (ret) {
+        error_report("IOMMU_VIOMMU_SET_VDEV_ID failed: %s", strerror(errno));
+        ret = -errno;
+    }
+
+    trace_iommufd_viommu_set_vdev_id(fd, viommu->viommu_id, dev_id,
+                                     vdev_id, ret);
+
+    return ret;
+}
+
+int iommufd_viommu_unset_vdev_id(IOMMUFDViommu *viommu, uint32_t dev_id,
+                                 uint64_t vdev_id)
+{
+    int ret, fd = viommu->iommufd->fd;
+    struct iommu_viommu_unset_vdev_id unset_vdev_id = {
+        .size = sizeof(unset_vdev_id),
+        .viommu_id = viommu->viommu_id,
+        .dev_id = dev_id,
+        .vdev_id = vdev_id,
+    };
+
+    ret = ioctl(fd, IOMMU_VIOMMU_UNSET_VDEV_ID, &unset_vdev_id);
+    if (ret) {
+        error_report("IOMMU_VIOMMU_UNSET_VDEV_ID failed: %s", strerror(errno));
+        ret = -errno;
+    }
+
+    trace_iommufd_viommu_unset_vdev_id(fd, viommu->viommu_id, dev_id,
+                                       vdev_id, ret);
+
+    return ret;
+}
+
 bool host_iommu_device_iommufd_attach_hwpt(HostIOMMUDeviceIOMMUFD *idev,
                                            uint32_t hwpt_id, Error **errp)
 {
