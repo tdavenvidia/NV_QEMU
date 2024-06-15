@@ -1409,6 +1409,36 @@ static void create_pcie_irq_map(const MachineState *ms,
                            0x7           /* PCI irq */);
 }
 
+static void create_cmdqv(const VirtMachineState *vms, hwaddr smmu_base,
+                         DeviceState *smmu_dev)
+{
+    const char compat[] = "tegra241,cmdqv";
+    hwaddr base = smmu_base + SMMU_IO_LEN;
+    MachineState *ms = MACHINE(vms);
+    char *node, *smmu_node;
+    DeviceState *dev;
+
+    dev = qdev_new("tegra241-cmdqv");
+    object_property_set_link(OBJECT(dev), "smmuv3", OBJECT(smmu_dev),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+
+    memory_region_add_subregion(get_system_memory(), base,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0));
+
+    node = g_strdup_printf("/cmdqv@%" PRIx64, base);
+    qemu_fdt_add_subnode(ms->fdt, node);
+    qemu_fdt_setprop(ms->fdt, node, "compatible", compat, sizeof(compat));
+    qemu_fdt_setprop_sized_cells(ms->fdt, node, "reg", 2, base, 2,
+                                 SMMU_CMDQV_IO_LEN);
+
+    smmu_node = g_strdup_printf("/smmuv3@%" PRIx64, smmu_base);
+    qemu_fdt_setprop_phandle(ms->fdt, node, "smmu", smmu_node);
+    g_free(smmu_node);
+
+    g_free(node);
+}
+
 static DeviceState *_create_smmu(const VirtMachineState *vms, PCIBus *bus,
                                  hwaddr base, hwaddr size, int irq,
                                  uint32_t smmu_phandle)
@@ -1430,6 +1460,9 @@ static DeviceState *_create_smmu(const VirtMachineState *vms, PCIBus *bus,
                              &error_abort);
     if (vms->iommu == VIRT_IOMMU_NESTED_SMMUV3) {
         object_property_set_bool(OBJECT(dev), "nested", true, &error_abort);
+        if (vms->smmu_has_cmdqv) {
+            object_property_set_bool(OBJECT(dev), "cmdqv", true, &error_abort);
+        }
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
@@ -1479,7 +1512,14 @@ static DeviceState *create_nested_smmu(const VirtMachineState *vms, PCIBus *bus,
     hwaddr size = SMMU_IO_LEN;
     DeviceState *dev;
 
-    dev = _create_smmu(vms, bus, base, size, irq, vms->nested_smmu_phandle[i]);
+    if (vms->smmu_has_cmdqv) {
+        base += i * SMMU_CMDQV_IO_LEN;
+        irq += i * NUM_SMMU_CMDQV_IRQS;
+        dev = _create_smmu(vms, bus, base, size, irq, vms->nested_smmu_phandle[i]);
+        create_cmdqv(vms, base, dev);
+    } else {
+        dev = _create_smmu(vms, bus, base, size, irq, vms->nested_smmu_phandle[i]);
+    }
     return dev;
 }
 
@@ -2976,6 +3016,20 @@ static void virt_set_default_bus_bypass_iommu(Object *obj, bool value,
     vms->default_bus_bypass_iommu = value;
 }
 
+static bool virt_get_cmdqv(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return vms->smmu_has_cmdqv;
+}
+
+static void virt_set_cmdqv(Object *obj, bool value, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    vms->smmu_has_cmdqv = value;
+}
+
 static CpuInstanceProperties
 virt_cpu_index_to_props(MachineState *ms, unsigned cpu_index)
 {
@@ -3410,6 +3464,11 @@ static void virt_machine_class_init(ObjectClass *oc, void *data)
                                           "Set on/off to enable/disable "
                                           "bypass_iommu for default root bus");
 
+    object_class_property_add_bool(oc, "cmdqv", virt_get_cmdqv, virt_set_cmdqv);
+    object_class_property_set_description(oc, "cmdqv",
+                                          "Set on/off to enable/disable "
+                                          "CMDQV for iommu=nested-smmuv3");
+
     object_class_property_add_bool(oc, "ras", virt_get_ras,
                                    virt_set_ras);
     object_class_property_set_description(oc, "ras",
@@ -3504,6 +3563,9 @@ static void virt_instance_init(Object *obj)
 
     /* Default disallows nested SMMU instantiation */
     vms->num_nested_smmus = 0;
+
+    /* Default disallows cmdqv instantiation */
+    vms->smmu_has_cmdqv = false;
 
     /* Default disallows RAS instantiation */
     vms->ras = false;
