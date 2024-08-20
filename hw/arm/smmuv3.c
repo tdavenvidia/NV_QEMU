@@ -16,6 +16,7 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <poll.h>
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
 #include "hw/irq.h"
@@ -254,6 +255,46 @@ void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *info)
         smmuv3_trigger_irq(s, SMMU_IRQ_GERROR, R_GERROR_EVENTQ_ABT_ERR_MASK);
     }
     info->recorded = true;
+}
+
+void *smmuv3_nested_event_thread(void *arg)
+{
+    struct pollfd pollfd = { }; //.events = POLLIN };
+    struct iommu_virq_arm_smmuv3 virq_data;
+    SMMUViommu *viommu = arg;
+    SMMUState *s = viommu->smmu;
+    SMMUv3State *smmuv3 = ARM_SMMUV3(s);
+    MemTxResult r;
+    ssize_t bytes;
+    Evt evt = {};
+    int ret;
+
+    if (!viommu->virq) {
+        return NULL;
+    }
+    pollfd.events = POLLIN;
+    pollfd.fd = viommu->virq->virq_fd;
+
+    while (1) {
+        ret = poll(&pollfd, 1, -1);
+        if (ret < 0) {
+            error_report("%s: poll failed: %d", __func__, ret);
+            return NULL;
+        }
+
+        bytes = read(pollfd.fd, &virq_data, sizeof(virq_data));
+        if (bytes <= 0) {
+            error_report("%s: read failed: %d", __func__, ret);
+            return NULL;
+        }
+
+        memcpy(&evt, &virq_data, sizeof(evt));
+        r = smmuv3_write_eventq(smmuv3, &evt);
+        if (r != MEMTX_OK) {
+            smmuv3_trigger_irq(smmuv3, SMMU_IRQ_GERROR,
+                               R_GERROR_EVENTQ_ABT_ERR_MASK);
+        }
+    }
 }
 
 static void smmuv3_nested_init_regs(SMMUv3State *s)
