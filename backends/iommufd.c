@@ -456,6 +456,40 @@ int iommufd_viommu_invalidate_cache(IOMMUFDBackend *be, uint32_t viommu_id,
     return ret;
 }
 
+struct IOMMUFDVirq *iommufd_viommu_alloc_irq(IOMMUFDViommu *viommu,
+                                             uint32_t type)
+{
+    int ret, fd = viommu->iommufd->fd;
+    struct IOMMUFDVirq *virq = g_malloc(sizeof(*virq));
+    struct iommu_virq_alloc alloc_virq = {
+        .size = sizeof(alloc_virq),
+        .flags = 0,
+        .type = type,
+        .viommu_id = viommu->viommu_id,
+    };
+
+    if (!virq) {
+        error_report("failed to allocate virq object");
+        return NULL;
+    }
+
+    ret = ioctl(fd, IOMMU_VIRQ_ALLOC, &alloc_virq);
+
+    trace_iommufd_viommu_alloc_irq(fd, viommu->viommu_id, type,
+                                   alloc_virq.out_virq_id,
+                                   alloc_virq.out_virq_fd, ret);
+    if (ret) {
+        error_report("IOMMU_VIRQ_ALLOC failed: %s", strerror(errno));
+        g_free(virq);
+        return NULL;
+    }
+
+    virq->viommu = viommu;
+    virq->virq_id = alloc_virq.out_virq_id;
+    virq->virq_fd = alloc_virq.out_virq_fd;
+    return virq;
+}
+
 bool host_iommu_device_iommufd_attach_hwpt(HostIOMMUDeviceIOMMUFD *idev,
                                            uint32_t hwpt_id, Error **errp)
 {
