@@ -741,7 +741,21 @@ static AddressSpace *smmuv3_accel_find_add_as(PCIBus *bus, void *opaque,
     sdev = &accel_dev->sdev;
 
     if (vfio_pci) {
-        return &accel_dev->as_sysmem;
+        /*
+         * For VFIO PCI devices behind the same SMMU, use shared AddressSpace
+         * to enable container sharing for devices in the same IOMMU group
+         */
+        SMMUv3State *s = ARM_SMMUV3(bs);
+        VFIOPCIDevice *vdev;
+
+        vdev = VFIO_PCI_BASE(pdev);
+
+	/*tdave: Remove the debug */
+        printf("DEBUG: VFIO device %s getting shared AddressSpace %p\n",
+                vdev->vbasedev.name,
+                &s->s_accel->shared_as);
+
+	return &s->s_accel->shared_as;
     } else {
         return &sdev->as;
     }
@@ -781,6 +795,8 @@ void smmuv3_accel_init(SMMUv3State *s)
     memory_region_add_subregion(&s_accel->root, 0, &s_accel->sysmem);
     qemu_mutex_init(&s_accel->event_thread_mutex);
 
+    /* Initialize shared AddressSpace for VFIO devices */
+    address_space_init(&s_accel->shared_as, &s_accel->root, "smmuv3-accel-shared");
     if (bs->has_cmdqv) {
         s_accel->cmdqv = tegra241_cmdqv_init(s);
     }

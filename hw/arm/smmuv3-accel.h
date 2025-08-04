@@ -53,6 +53,7 @@ typedef struct SMMUv3AccelDevice {
 typedef struct SMMUv3AccelState {
     MemoryRegion root;
     MemoryRegion sysmem;
+    AddressSpace shared_as;  /* Shared AddressSpace for VFIO devices */
     SMMUViommu *viommu;
     QemuThread event_thread_id;
     bool event_thread_stop;
