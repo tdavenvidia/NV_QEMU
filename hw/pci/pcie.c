@@ -1212,7 +1212,8 @@ int pcie_acs_init(PCIDevice *dev, uint16_t offset, uint16_t ctrl_bits, Error **e
     }
 
     pci_set_word(dev->config + offset + PCI_ACS_CAP, cap_bits);
-    pci_set_word(dev->wmask + offset + PCI_ACS_CTRL, cap_bits);
+    /* Block guest writes to ACS Control entirely; QEMU sets ctrl_bits */
+    pci_set_word(dev->wmask + offset + PCI_ACS_CTRL, 0);
     pci_set_word(dev->config + offset + PCI_ACS_CTRL, ctrl_bits);
 
     return 0;
