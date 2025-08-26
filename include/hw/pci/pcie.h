@@ -86,6 +86,8 @@ struct PCIExpressDevice {
 
 #define COMPAT_PROP_PCP "power_controller_present"
 
+#define ACS_CAP_NOT_CONFIGURED 0xFFFF
+
 /* PCI express capability helper functions */
 int pcie_cap_init(PCIDevice *dev, uint8_t offset, uint8_t type,
                   uint8_t port, Error **errp);

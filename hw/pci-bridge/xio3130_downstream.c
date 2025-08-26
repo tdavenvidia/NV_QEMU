@@ -63,7 +63,7 @@ static void xio3130_downstream_reset(DeviceState *qdev)
     pcie_cap_deverr_reset(d);
     pcie_cap_slot_reset(d);
     pcie_cap_arifwd_reset(d);
-    pcie_acs_reset(d, p->acs_caps);
+    pcie_acs_reset(d, p->acs_caps == ACS_CAP_NOT_CONFIGURED ? 0 : p->acs_caps);
     pci_bridge_reset(qdev);
 }
 
@@ -115,7 +115,8 @@ static void xio3130_downstream_realize(PCIDevice *d, Error **errp)
         goto err;
     }
 
-    rc = pcie_acs_init(d, XIO3130_ACS_OFFSET, p->acs_caps, errp);
+    rc = pcie_acs_init(d, XIO3130_ACS_OFFSET,
+                       p->acs_caps == ACS_CAP_NOT_CONFIGURED ? 0 : p->acs_caps, errp);
     if (rc < 0) {
         goto err;
     }
@@ -146,7 +147,7 @@ static void xio3130_downstream_exitfn(PCIDevice *d)
 static const Property xio3130_downstream_props[] = {
     DEFINE_PROP_BIT(COMPAT_PROP_PCP, PCIDevice, cap_present,
                     QEMU_PCIE_SLTCAP_PCP_BITNR, true),
-    DEFINE_PROP_UINT16("acs-caps", PCIEPort, acs_caps, 0),
+    DEFINE_PROP_UINT16("acs-caps", PCIEPort, acs_caps, ACS_CAP_NOT_CONFIGURED),
 };
 
 static const VMStateDescription vmstate_xio3130_downstream = {

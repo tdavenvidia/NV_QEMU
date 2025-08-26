@@ -1264,6 +1264,7 @@ int pcie_acs_init(PCIDevice *dev, uint16_t offset, uint16_t ctrl_bits, Error **e
 {
     bool is_downstream = pci_is_express_downstream_port(dev);
     uint16_t cap_bits = 0;
+    PCIEPort *p = PCIE_PORT(dev);
 
     /* For endpoints, only multifunction devs may have an ACS capability: */
     assert(is_downstream ||
@@ -1285,7 +1286,7 @@ int pcie_acs_init(PCIDevice *dev, uint16_t offset, uint16_t ctrl_bits, Error **e
         cap_bits = PCI_ACS_SV | PCI_ACS_TB | PCI_ACS_RR |
             PCI_ACS_CR | PCI_ACS_UF | PCI_ACS_DT;
 
-        if (ctrl_bits & ~cap_bits) {
+        if (p->acs_caps != ACS_CAP_NOT_CONFIGURED && (ctrl_bits & ~cap_bits)) {
              error_setg(errp, "Unsupported ACS capabilities 0x%hx were supplied. "
                         "Supported capabilities are 0x%hx", ctrl_bits & ~cap_bits,
                         cap_bits);
@@ -1294,7 +1295,14 @@ int pcie_acs_init(PCIDevice *dev, uint16_t offset, uint16_t ctrl_bits, Error **e
     }
 
     pci_set_word(dev->config + offset + PCI_ACS_CAP, cap_bits);
-    pci_set_word(dev->wmask + offset + PCI_ACS_CTRL, cap_bits);
+
+    if (is_downstream && p->acs_caps != ACS_CAP_NOT_CONFIGURED) {
+        /* Block guest writes to ACS Control entirely to preserve QEMU ACS settings */
+        pci_set_word(dev->wmask + offset + PCI_ACS_CTRL, 0);
+    } else {
+        pci_set_word(dev->wmask + offset + PCI_ACS_CTRL, cap_bits);
+    }
+
     pci_set_word(dev->config + offset + PCI_ACS_CTRL, ctrl_bits);
 
     return 0;
