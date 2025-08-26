@@ -54,7 +54,7 @@ static void rp_reset_hold(Object *obj, ResetType type)
     pcie_cap_deverr_reset(d);
     pcie_cap_slot_reset(d);
     pcie_cap_arifwd_reset(d);
-    pcie_acs_reset(d, p->acs_caps);
+    pcie_acs_reset(d, p->acs_caps == ACS_CAP_NOT_CONFIGURED ? 0 : p->acs_caps);
     pcie_aer_root_reset(d);
     pci_bridge_reset(qdev);
     pci_bridge_disable_base_limit(d);
@@ -119,7 +119,9 @@ static void rp_realize(PCIDevice *d, Error **errp)
     rp_aer_vector_update(d);
 
     if (rpc->acs_offset) {
-        rc = pcie_acs_init(d, rpc->acs_offset, p->acs_caps, errp);
+        rc = pcie_acs_init(d, rpc->acs_offset,
+                           p->acs_caps == ACS_CAP_NOT_CONFIGURED ? 0 :
+                           p->acs_caps, errp);
         if (rc < 0) {
             goto err;
         }
@@ -155,7 +157,7 @@ static void rp_exit(PCIDevice *d)
 static const Property rp_props[] = {
     DEFINE_PROP_BIT(COMPAT_PROP_PCP, PCIDevice, cap_present,
                     QEMU_PCIE_SLTCAP_PCP_BITNR, true),
-    DEFINE_PROP_UINT16("acs-caps", PCIEPort, acs_caps, 0),
+    DEFINE_PROP_UINT16("acs-caps", PCIEPort, acs_caps, ACS_CAP_NOT_CONFIGURED),
 };
 
 static void rp_instance_post_init(Object *obj)
