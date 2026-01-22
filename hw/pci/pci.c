@@ -80,6 +80,7 @@ static const Property pci_props[] = {
     DEFINE_PROP_STRING("romfile", PCIDevice, romfile),
     DEFINE_PROP_UINT32("romsize", PCIDevice, romsize, UINT32_MAX),
     DEFINE_PROP_INT32("rombar",  PCIDevice, rom_bar, -1),
+    DEFINE_PROP_STRING("pci-boot-config", PCIDevice, pci_boot_config),
     DEFINE_PROP_BIT("multifunction", PCIDevice, cap_present,
                     QEMU_PCI_CAP_MULTIFUNCTION_BITNR, false),
     DEFINE_PROP_BIT("x-pcie-lnksta-dllla", PCIDevice, cap_present,
@@ -202,6 +203,46 @@ static void pci_bus_unrealize(BusState *qbus)
     qemu_remove_machine_init_done_notifier(&bus->machine_done);
 
     vmstate_unregister(NULL, &vmstate_pcibus, bus);
+}
+
+/* Parse pci-boot-config into per-BAR fixed addresses and flag enable */
+static void pci_parse_pci_boot_config(PCIDevice *pci_dev)
+{
+    /* default: disabled and unmapped */
+    for (int i = 0; i < PCI_NUM_REGIONS; ++i) {
+        pci_dev->fixed_bar_pci_boot_config_addr[i] = PCI_BAR_UNMAPPED;
+    }
+    pci_dev->fixed_bar_pci_boot_config = false;
+
+    if (!pci_dev->pci_boot_config || !*pci_dev->pci_boot_config) {
+        return;
+    }
+
+    /* Debug: log raw property when supplied */
+    warn_report("PCI %s: pci-boot-config='%s'",
+                pci_dev->name, pci_dev->pci_boot_config);
+
+    /* Format: barN@<addr>[,barM@<addr>...] */
+    char **entries = g_strsplit(pci_dev->pci_boot_config, ",", -1);
+    for (char **e = entries; e && *e; ++e) {
+        unsigned bar = 0;
+        const char *at = strchr(*e, '@');
+        if (!at) {
+            continue;
+        }
+        if (sscanf(*e, "bar%u@", &bar) != 1) {
+            continue;
+        }
+        if (bar >= PCI_NUM_REGIONS) {
+            continue;
+        }
+        pcibus_t addr = (pcibus_t)g_ascii_strtoull(at + 1, NULL, 0);
+        pci_dev->fixed_bar_pci_boot_config_addr[bar] = addr;
+        pci_dev->fixed_bar_pci_boot_config = true;
+        warn_report("PCI %s: parsed fixed BAR%u GPA=0x%"FMT_PCIBUS,
+                    pci_dev->name, bar, (uint64_t)addr);
+    }
+    g_strfreev(entries);
 }
 
 static int pcibus_num(PCIBus *bus)
@@ -2337,6 +2378,9 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
         pci_dev->romfile = g_strdup(pc->romfile);
         is_default_rom = true;
     }
+
+    /* Parse (but do not enforce) fixed BAR placements if provided */
+    pci_parse_pci_boot_config(pci_dev);
 
     pci_add_option_rom(pci_dev, is_default_rom, &local_err);
     if (local_err) {
