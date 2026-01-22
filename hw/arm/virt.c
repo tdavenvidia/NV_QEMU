@@ -1955,6 +1955,22 @@ static void virt_set_high_memmap(VirtMachineState *vms,
             vms->highest_gpa = base - 1;
         }
     }
+
+    /* Apply user-provided PCIe MMIO window override when present */
+    if (vms->pcie_mmio_window_override) {
+        vms->memmap[VIRT_HIGH_PCIE_MMIO].base = vms->override_pcie_mmio_base;
+        vms->memmap[VIRT_HIGH_PCIE_MMIO].size = vms->override_pcie_mmio_size;
+        vms->highest_gpa = BIT_ULL(pa_bits) - 1;
+        /* Debug: show the applied high PCIe MMIO window and resulting highest_gpa */
+        warn_report("virt: applied high PCIe MMIO window base=0x%" PRIx64
+                    " size=0x%" PRIx64 " end=0x%" PRIx64
+                    " highest_gpa=0x%" PRIx64,
+                    (uint64_t)vms->memmap[VIRT_HIGH_PCIE_MMIO].base,
+                    (uint64_t)vms->memmap[VIRT_HIGH_PCIE_MMIO].size,
+                    (uint64_t)(vms->memmap[VIRT_HIGH_PCIE_MMIO].base +
+                               vms->memmap[VIRT_HIGH_PCIE_MMIO].size - 1),
+                    (uint64_t)vms->highest_gpa);
+    }
 }
 
 static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
@@ -2886,6 +2902,54 @@ static void virt_set_gic_version(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *virt_get_pcie_mmio_window(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    hwaddr base = vms->memmap[VIRT_HIGH_PCIE_MMIO].base;
+    hwaddr size = vms->memmap[VIRT_HIGH_PCIE_MMIO].size;
+    if (!vms->pcie_mmio_window_override || size == 0) {
+        return g_strdup("");
+    }
+    return g_strdup_printf("0x%" PRIx64 ":0x%" PRIx64,
+                           (uint64_t)base, (uint64_t)size);
+}
+
+static void virt_set_pcie_mmio_window(Object *obj, const char *value, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    uint64_t base = 0, size = 0;
+    const char *sep;
+
+    if (!value || !*value) {
+        vms->pcie_mmio_window_override = false;
+        vms->override_pcie_mmio_base = 0;
+        vms->override_pcie_mmio_size = 0;
+        return;
+    }
+
+    sep = strchr(value, ':');
+    if (!sep || sep == value || !*(sep + 1)) {
+        error_setg(errp, "pcie-mmio-window expects BASE:SIZE");
+        return;
+    }
+    errno = 0;
+    base = strtoull(value, NULL, 0);
+    size = strtoull(sep + 1, NULL, 0);
+    if (errno || size == 0) {
+        error_setg(errp, "invalid pcie-mmio-window value");
+        return;
+    }
+
+    vms->pcie_mmio_window_override = true;
+    vms->override_pcie_mmio_base = base;
+    vms->override_pcie_mmio_size = size;
+    vms->highmem_mmio = true;
+    /* Debug: echo the requested high PCIe MMIO override */
+    warn_report("virt: pcie-mmio-window override requested base=0x%" PRIx64
+                " size=0x%" PRIx64,
+                (uint64_t)base, (uint64_t)size);
+}
+
 static char *virt_get_iommu(Object *obj, Error **errp)
 {
     VirtMachineState *vms = VIRT_MACHINE(obj);
@@ -3443,6 +3507,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                           "Set the IOMMU type. "
                                           "Valid values are none and smmuv3");
 
+    object_class_property_add_str(oc, "pcie-mmio-window",
+                                  virt_get_pcie_mmio_window,
+                                  virt_set_pcie_mmio_window);
+    object_class_property_set_description(oc, "pcie-mmio-window",
+                                          "Override the high PCIe MMIO window as BASE:SIZE");
+
     object_class_property_add_bool(oc, "default-bus-bypass-iommu",
                                    virt_get_default_bus_bypass_iommu,
                                    virt_set_default_bus_bypass_iommu);
@@ -3497,6 +3567,8 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                           "Override the default value of field OEM Table ID "
                                           "in ACPI table header."
                                           "The string may be up to 8 bytes in size");
+
+    /* grace-pcie-mmio-identity removed in favor of pcie-mmio-window */
 
 }
 
