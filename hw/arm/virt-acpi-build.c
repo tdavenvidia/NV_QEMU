@@ -49,6 +49,8 @@
 #include "hw/cxl/cxl.h"
 #include "hw/pci/pcie_host.h"
 #include "hw/pci/pci.h"
+#include "hw/vfio/pci.h"
+#include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/arm/virt.h"
@@ -140,8 +142,579 @@ static void build_acpi0017(Aml *table)
     aml_append(table, scope);
 }
 
+typedef struct {
+    uint64_t addr;
+    uint64_t end;
+    uint64_t flags;
+} PhysBAR;
+
+typedef struct {
+    uint64_t wbase;
+    uint64_t wlimit;
+    uint64_t wbase64;
+    uint64_t wlimit64;
+    uint64_t rbase;
+    uint64_t rlimit;
+    uint64_t rsize;
+    uint64_t piobase;
+    bool     available;
+    bool     search_mmio64;
+    PCIDevice *dev;
+    PCIBus *bus;
+    struct GPEXConfig *cfg;
+    bool debug;
+} VirtPciAllocCfg;
+
+#define IORESOURCE_PREFETCH     0x00002000    /* No side effects */
+#define IORESOURCE_MEM_64       0x00100000
+
+/* Global list of claimed fixed 64-bit prefetchable BAR ranges (first-win) */
+typedef struct FixedClaim {
+    uint64_t start;
+    uint64_t end;
+    PCIDevice *owner;
+    int bar;
+} FixedClaim;
+static GArray *virt_fixed_claims;
+
+static void virt_fixed_claims_reset(void)
+{
+    if (virt_fixed_claims) {
+        g_array_free(virt_fixed_claims, true);
+        virt_fixed_claims = NULL;
+    }
+    virt_fixed_claims = g_array_new(false, true, sizeof(FixedClaim));
+}
+
+static bool virt_fixed_claims_conflicts(uint64_t start, uint64_t end,
+                                        uint64_t wbase64, uint64_t wlimit64,
+                                        uint64_t *conflict_end)
+{
+    /* Hard guard: out-of-window ranges are invalid input */
+    if (start < wbase64 || end > wlimit64) {
+        error_report("acpi/mmio64: placement [0x%"PRIx64"..0x%"PRIx64"] out of window "
+                     "[0x%"PRIx64"..0x%"PRIx64"]",
+                     start, end, wbase64, wlimit64);
+        exit(1);
+    }
+    if (!virt_fixed_claims) {
+        return false;
+    }
+    for (guint i = 0; i < virt_fixed_claims->len; i++) {
+        FixedClaim *c = &g_array_index(virt_fixed_claims, FixedClaim, i);
+        if (ranges_overlap(start, end - start + 1, c->start, c->end - c->start + 1)) {
+            if (conflict_end) {
+                *conflict_end = c->end;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void virt_fixed_claims_add(uint64_t start, uint64_t end, PCIDevice *dev, int bar)
+{
+    FixedClaim cl = { .start = start, .end = end, .owner = dev, .bar = bar };
+    g_array_append_val(virt_fixed_claims, cl);
+    warn_report("acpi/mmio64: claim-add [%02x:%02x.%x] BAR%d "
+                "=[0x%"PRIx64"..0x%"PRIx64"]",
+                pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                bar, start, end);
+}
+
+static void pci_validate_fixed_bar(PCIDevice *dev,
+                                        int bar_index,
+                                        uint64_t addr,
+                                        uint64_t size,
+                                        uint64_t wbase64,
+                                        uint64_t wlimit64)
+{
+    PCIIORegion *r = &dev->io_regions[bar_index];
+    if (!r->size || !(r->type & PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+        error_report("acpi/mmio64: invalid pci-boot-config for %s [%02x:%02x.%x] BAR%d: "
+                     "BAR not 64-bit or size=0 (type=0x%x size=0x%"PRIx64")",
+                     dev->name, pci_dev_bus_num(dev),
+                     PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                     bar_index, r->type, (uint64_t)r->size);
+        exit(1);
+    }
+    /* Guard: 64-bit non-prefetchable BARs must not be placed behind bridges. */
+    if (!(r->type & PCI_BASE_ADDRESS_MEM_PREFETCH) &&
+        !pci_bus_is_root(pci_get_bus(dev))) {
+        error_report("acpi/mmio64: invalid pci-boot-config for %s [%02x:%02x.%x] BAR%d: "
+                     "64-bit non-prefetchable BAR cannot be assigned behind a PCIe bridge",
+                     dev->name, pci_dev_bus_num(dev),
+                     PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn), bar_index);
+        exit(1);
+    }
+    uint64_t end = addr + size - 1;
+    if (addr & (size - 1)) {
+        error_report("acpi/mmio64: invalid pci-boot-config alignment for %s [%02x:%02x.%x] "
+                     "BAR%d: addr=0x%"PRIx64" size=0x%"PRIx64,
+                     dev->name, pci_dev_bus_num(dev),
+                     PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                     bar_index, addr, size);
+        exit(1);
+    }
+    if (addr < wbase64 || end > wlimit64) {
+        error_report("acpi/mmio64: pci-boot-config out of window for %s [%02x:%02x.%x] BAR%d "
+                     "range=[0x%"PRIx64"..0x%"PRIx64"] window=[0x%"PRIx64"..0x%"PRIx64"]",
+                     dev->name, pci_dev_bus_num(dev),
+                     PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                     bar_index, addr, end, wbase64, wlimit64);
+        exit(1);
+    }
+}
+
+
+static void pci_check_fixed_bar_overlap(PCIDevice *dev, PhysBAR *pbars)
+{
+    for (int i = 0; i < PCI_ROM_SLOT; i++) {
+        if (!(pbars[i].flags & IORESOURCE_PREFETCH)) {
+            continue;
+        }
+        for (int j = i + 1; j < PCI_ROM_SLOT; j++) {
+            if (!(pbars[j].flags & IORESOURCE_PREFETCH)) {
+                continue;
+            }
+            if (ranges_overlap(pbars[i].addr, dev->io_regions[i].size,
+                               pbars[j].addr, dev->io_regions[j].size)) {
+                error_report("acpi/mmio64: invalid pci-boot-config — fixed BAR overlap on %s [%02x:%02x.%x]: "
+                             "BAR%d [0x%lx..0x%lx] vs BAR%d [0x%lx..0x%lx]",
+                             dev->name, pci_dev_bus_num(dev),
+                             PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                             i, pbars[i].addr, pbars[i].addr + dev->io_regions[i].size - 1,
+                             j, pbars[j].addr, pbars[j].addr + dev->io_regions[j].size - 1);
+                exit(1);
+            }
+        }
+    }
+}
+
+static void pci_get_bridge_window(PCIBus *bus, void *opaque)
+{
+    PCIDevice *bridge = pci_bridge_get_device(bus);
+    VirtPciAllocCfg *ncfg = (VirtPciAllocCfg *)opaque;
+    struct GPEXConfig *cfg = ncfg->cfg;
+
+    if (!bridge) {
+        ncfg->wbase = cfg->mmio32.base;
+        ncfg->wlimit = cfg->mmio32.base + cfg->mmio32.size - 1;
+        ncfg->wbase64 = cfg->mmio64.base;
+        ncfg->wlimit64 = cfg->mmio64.base + cfg->mmio64.size - 1;
+    } else {
+        ncfg->wbase = pci_bridge_get_base(bridge, PCI_BASE_ADDRESS_MEM_TYPE_32);
+        ncfg->wlimit = pci_bridge_get_limit(bridge, PCI_BASE_ADDRESS_MEM_TYPE_32);
+        ncfg->wbase64 = pci_bridge_get_base(bridge, PCI_BASE_ADDRESS_MEM_PREFETCH);
+        ncfg->wlimit64 = pci_bridge_get_limit(bridge, PCI_BASE_ADDRESS_MEM_PREFETCH);
+    }
+}
+
+static void pci_update_prefetch_window(PCIBus *bus, uint64_t base, uint64_t limit)
+{
+    PCIDevice *bridge = pci_bridge_get_device(bus);
+    uint32_t value0, value1;
+
+    assert(bridge);
+
+    value0 = (uint32_t)(extract64(base, 20, 12) << 4);
+    value1 = (uint32_t)(extract64(limit, 20, 12) << 4);
+    pci_host_config_write_common(bridge,
+                                 PCI_PREF_MEMORY_BASE,
+                                 pci_config_size(bridge),
+                                 value0 | PCI_PREF_RANGE_TYPE_64,
+                                 2);
+    pci_host_config_write_common(bridge,
+                                 PCI_PREF_BASE_UPPER32,
+                                 pci_config_size(bridge),
+                                 (uint32_t)(base >> 32),
+                                 4);
+    pci_host_config_write_common(bridge,
+                                 PCI_PREF_MEMORY_LIMIT,
+                                 pci_config_size(bridge),
+                                 value1 | PCI_PREF_RANGE_TYPE_64,
+                                 2);
+    pci_host_config_write_common(bridge,
+                                 PCI_PREF_LIMIT_UPPER32,
+                                 pci_config_size(bridge),
+                                 (uint32_t)(limit >> 32),
+                                 4);
+}
+
+
+/* Helper: program a set of packed prefetchable 64-bit BARs */
+static void pci_program_pbars(PCIDevice *dev, PhysBAR *pbars, struct GPEXConfig *cfg)
+{
+    int idx;
+    uint32_t laddr;
+
+    for (idx = 0; idx < PCI_ROM_SLOT; idx++) {
+        PhysBAR *pbar = &pbars[idx];
+        if (!(pbar->flags & IORESOURCE_PREFETCH)) {
+            continue;
+        }
+        laddr = pbar->addr & PCI_BASE_ADDRESS_MEM_MASK;
+        laddr |= PCI_BASE_ADDRESS_MEM_TYPE_64;
+        /* Set PREFETCH bit only if the BAR itself is prefetchable */
+        if (dev->io_regions[idx].type & PCI_BASE_ADDRESS_MEM_PREFETCH) {
+            laddr |= PCI_BASE_ADDRESS_MEM_PREFETCH;
+        }
+        pci_host_config_write_common(dev,
+                                     PCI_BASE_ADDRESS_0 + (idx * 4),
+                                     pci_config_size(dev),
+                                     laddr,
+                                     4);
+        pci_host_config_write_common(dev,
+                                     PCI_BASE_ADDRESS_0 + (idx * 4) + 4,
+                                     pci_config_size(dev),
+                                     (uint32_t)(pbar->addr >> 32),
+                                     4);
+        warn_report("acpi/mmio64: programmed %s [%02x:%02x.%x] BAR%d -> 0x%lx",
+                    dev->name, pci_dev_bus_num(dev),
+                    PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                    idx, pbar->addr);
+        cfg->preserve_config = true;
+    }
+}
+
+typedef struct BusDemandCtx {
+    GHashTable *bus_to_demand; /* key: PCIBus* , value: uint64_t* bytes */
+} BusDemandCtx;
+
+static void pci_bus_add_demand_bytes(PCIBus *bus, uint64_t bytes, BusDemandCtx *bdc)
+{
+    uint64_t *p = g_hash_table_lookup(bdc->bus_to_demand, bus);
+    if (!p) {
+        p = g_new0(uint64_t, 1);
+        g_hash_table_insert(bdc->bus_to_demand, bus, p);
+    }
+    *p += bytes;
+}
+
+static void pci_collect_bus_pref64_demand_dev(PCIBus *bus, PCIDevice *dev, void *opaque)
+{
+    BusDemandCtx *bdc = (BusDemandCtx *)opaque;
+    for (int idx = 0; idx < PCI_ROM_SLOT; idx++) {
+        PCIIORegion *r = &dev->io_regions[idx];
+        if (!r->size) {
+            continue;
+        }
+        if ((r->type & PCI_BASE_ADDRESS_SPACE_IO) ||
+            !(r->type & PCI_BASE_ADDRESS_MEM_TYPE_64) ||
+            !(r->type & PCI_BASE_ADDRESS_MEM_PREFETCH)) {
+            continue; /* we only count 64-bit PREF demand here */
+        }
+        /* If this BAR was fixed by pci-boot-config, it's already placed (no demand). */
+        if (dev->fixed_bar_pci_boot_config &&
+            dev->fixed_bar_pci_boot_config_addr[idx] != PCI_BAR_UNMAPPED) {
+            continue;
+        }
+        pci_bus_add_demand_bytes(bus, r->size, bdc);
+    }
+}
+
+static void pci_collect_bus_pref64_demand_bus(PCIBus *bus, void *opaque)
+{
+    BusDemandCtx *bdc = (BusDemandCtx *)opaque;
+    pci_for_each_device_under_bus(bus, pci_collect_bus_pref64_demand_dev, bdc);
+}
+
+static void pci_debug_print_bus_pref64_demand(PCIBus *root)
+{
+    BusDemandCtx bdc = {
+        .bus_to_demand = g_hash_table_new(g_direct_hash, g_direct_equal),
+    };
+    pci_for_each_bus(root, pci_collect_bus_pref64_demand_bus, &bdc);
+
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, bdc.bus_to_demand);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        PCIBus *bus = (PCIBus *)key;
+        uint64_t *bytes = (uint64_t *)value;
+        if (*bytes) {
+            warn_report("acpi/mmio64: bus [%02x] demand_pref64=0x%"PRIx64" bytes",
+                        pci_bus_num(bus), *bytes);
+        }
+    }
+    g_hash_table_destroy(bdc.bus_to_demand);
+}
+
+
+
+
+/* Three-phase programming context */
+typedef enum {
+    PCI_PHASE_CLAIM_AND_PROGRAM_FIXED_BARS = 0,
+    PCI_PHASE_PACK_BARS_FOR_FIXED_BAR_DEVICES = 1,
+    PCI_PHASE_PACK_BARS_FOR_NON_FIXED_DEVICES = 2,
+} VirtPciPhase;
+
+typedef struct {
+    struct GPEXConfig *cfg;
+    VirtPciPhase phase;
+    GHashTable *had_fixed; /* set of PCIDevice* that had at least one fixed BAR */
+} VirtPciProgramCtx;
+
+static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque)
+{
+    VirtPciProgramCtx *pctx = (VirtPciProgramCtx *)opaque;
+    struct GPEXConfig *cfg = pctx->cfg;
+    PhysBAR *pbar, pbars[PCI_ROM_SLOT];
+    int idx;
+    bool had_any_fixed = false;
+
+    pbar = pbars;
+    memset(pbar, 0, sizeof(pbars));
+
+    switch (pctx->phase) {
+    case PCI_PHASE_CLAIM_AND_PROGRAM_FIXED_BARS: {
+        if (!dev->fixed_bar_pci_boot_config) {
+            return;
+        }
+        warn_report("acpi/mmio64: phase1 (fixed) dev [%02x:%02x.%x] %s",
+                    pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                    dev->name);
+        /* Place fixed bars and program them */
+        for (idx = 0; idx < PCI_ROM_SLOT; idx++) {
+            PCIIORegion *r = &dev->io_regions[idx];
+            if (dev->fixed_bar_pci_boot_config_addr[idx] == PCI_BAR_UNMAPPED) {
+                continue;
+            }
+            pci_validate_fixed_bar(dev, idx,
+                                        dev->fixed_bar_pci_boot_config_addr[idx],
+                                        r->size,
+                                        cfg->mmio64.base,
+                                        cfg->mmio64.base + cfg->mmio64.size - 1);
+            /* cross-device first-win against existing claims */
+            {
+                uint64_t start = dev->fixed_bar_pci_boot_config_addr[idx];
+                uint64_t end = start + r->size - 1;
+                if (virt_fixed_claims_conflicts(start, end,
+                                                cfg->mmio64.base,
+                                                cfg->mmio64.base + cfg->mmio64.size - 1,
+                                                NULL)) {
+                    error_report("acpi/mmio64: invalid pci-boot-config — fixed BAR for %s [%02x:%02x.%x] "
+                                 "BAR%d [0x%"PRIx64"..0x%"PRIx64"] overlaps an existing fixed range",
+                                 dev->name, pci_dev_bus_num(dev),
+                                 PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                                 idx, start, end);
+                    exit(1);
+                }
+                virt_fixed_claims_add(start, end, dev, idx);
+            }
+            pbars[idx].addr = dev->fixed_bar_pci_boot_config_addr[idx];
+            pbars[idx].end = pbars[idx].addr + r->size - 1;
+            pbars[idx].flags = IORESOURCE_PREFETCH;
+            had_any_fixed = true;
+        }
+        if (had_any_fixed) {
+            g_hash_table_insert(pctx->had_fixed, dev, dev);
+        }
+        /* Abort if intra-device fixed overlap */
+        pci_check_fixed_bar_overlap(dev, pbars);
+        /* Program fixed BARs now */
+        pci_program_pbars(dev, pbars, cfg);
+        break;
+    }
+    case PCI_PHASE_PACK_BARS_FOR_FIXED_BAR_DEVICES: {
+        if (!g_hash_table_contains(pctx->had_fixed, dev)) {
+            return;
+        }
+        warn_report("acpi/mmio64: phase2 (pack-fixed-dev) dev [%02x:%02x.%x] %s",
+                    pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                    dev->name);
+        /*
+         * Phase 2 seeding policy:
+         */
+        
+	/* Program packed BARs */
+        //pci_program_pbars(dev, pbars, cfg);
+        break;
+    }
+    case PCI_PHASE_PACK_BARS_FOR_NON_FIXED_DEVICES: {
+        //TODO
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void pci_bus_program_bars_phase(PCIBus *bus, void *opaque)
+{
+    pci_for_each_device_under_bus(bus, pci_dev_program_bars_phase, opaque);
+}
+
+static void pci_collect_mmio64_window(PCIBus *bus, PCIDevice *dev, void *opaque)
+{
+    VirtPciAllocCfg *ncfg = (VirtPciAllocCfg *)opaque;
+    uint64_t rbase, rlimit;
+    uint32_t idx;
+
+    for (idx = 0; idx < PCI_ROM_SLOT; idx++) {
+        PCIIORegion *res = &dev->io_regions[idx];
+
+        if ((!res->size) ||
+            ((res->addr < ncfg->wbase64) || (res->addr > ncfg->wlimit64))) {
+            continue;
+        }
+        rbase = res->addr;
+        rlimit = res->addr + res->size - 1;
+        ncfg->rbase = MIN(ncfg->rbase, rbase);
+        ncfg->rlimit = MAX(ncfg->rlimit, rlimit);
+    }
+
+    if (IS_PCI_BRIDGE(dev)) {
+        rbase = pci_bridge_get_base(dev, PCI_BASE_ADDRESS_MEM_PREFETCH);
+        rlimit = pci_bridge_get_limit(dev, PCI_BASE_ADDRESS_MEM_PREFETCH);
+
+        if ((rbase < ncfg->wbase64) ||
+            (rbase > ncfg->wlimit64) ||
+            (rlimit < ncfg->wbase64) ||
+            (rlimit > ncfg->wlimit64)) {
+            return;
+        }
+
+        ncfg->rbase = MIN(ncfg->rbase, rbase);
+        ncfg->rlimit = MAX(ncfg->rlimit, rlimit);
+    }
+}
+
+static void pci_bus_update_prefetch_window(PCIBus *bus, void *opaque)
+{
+    VirtPciAllocCfg *ncfg = (VirtPciAllocCfg *)opaque;
+    ncfg->rbase = ~0;
+    ncfg->rlimit = 0;
+
+    assert(pci_bridge_get_device(bus));
+    pci_for_each_device_under_bus(bus, pci_collect_mmio64_window, ncfg);
+
+    if (ncfg->rlimit > ncfg->rbase) {
+        pci_update_prefetch_window(bus, ncfg->rbase, ncfg->rlimit);
+        warn_report("acpi/mmio64: bridge [%02x:%02x.%x] PREF window "
+                    "=[0x%"PRIx64"..0x%"PRIx64"]",
+                    pci_dev_bus_num(pci_bridge_get_device(bus)),
+                    PCI_SLOT(pci_bridge_get_device(bus)->devfn),
+                    PCI_FUNC(pci_bridge_get_device(bus)->devfn),
+                    (uint64_t)ncfg->rbase, (uint64_t)ncfg->rlimit);
+    }
+}
+
+static void pci_dev_check_unassigned_mmio64(PCIBus *bus, PCIDevice *dev, void *opaque)
+{
+    VirtPciAllocCfg *ncfg0 = (VirtPciAllocCfg *)opaque;
+    uint64_t base, limit;
+
+    if (!IS_PCI_BRIDGE(dev)) {
+        return;
+    }
+
+    base = pci_bridge_get_base(dev, PCI_BASE_ADDRESS_MEM_PREFETCH);
+    limit = pci_bridge_get_limit(dev, PCI_BASE_ADDRESS_MEM_PREFETCH);
+
+    warn_report("acpi/mmio64: bridge [%02x:%02x.%x] current PREF "
+                "=[0x%"PRIx64"..0x%"PRIx64"] window=[0x%"PRIx64"..0x%"PRIx64"]",
+                pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+                (uint64_t)base, (uint64_t)limit,
+                (uint64_t)ncfg0->wbase64, (uint64_t)ncfg0->wlimit64);
+
+    /* Unprogrammed or empty window: This behavior is typical when no child devices
+     * downstream of the bridge have requested any Base Address Register*/
+    if (base >= limit) {
+        warn_report("acpi/mmio64: bridge [%02x:%02x.%x] PREF window unprogrammed/empty; no action",
+                    pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
+        return;
+    }
+
+    /* Already in-window: nothing to do */
+    if ((base >= ncfg0->wbase64) &&
+        (limit <= ncfg0->wlimit64)) {
+        warn_report("acpi/mmio64: bridge [%02x:%02x.%x] PREF already in-window; skip",
+                    pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
+        return;
+    }
+
+    /* Out-of-window: This should never happen */
+    warn_report("acpi/mmio64: bridge [%02x:%02x.%x] PREF out of mmio64 window; no action",
+                pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
+}
+
+static void pci_bus_check_unassigned_mmio64(PCIBus *bus, void *opaque)
+{
+    pci_for_each_device_under_bus(bus, pci_dev_check_unassigned_mmio64, opaque);
+}
+
+static void pci_fixed_bar_allocator(struct GPEXConfig *cfg)
+{
+    VirtPciAllocCfg ncfg1, *ncfg = &ncfg1;
+    PCIBus *bus = cfg->bus;
+
+    /* Reset fixed-claims tracking (first-win across devices) */
+    virt_fixed_claims_reset();
+
+    warn_report("acpi/mmio64: allocator begin mmio64=[0x%"PRIx64"..0x%"PRIx64"]",
+                (uint64_t)cfg->mmio64.base,
+                (uint64_t)(cfg->mmio64.base + cfg->mmio64.size - 1));
+
+    pci_debug_print_bus_pref64_demand(bus);
+    /* Phase 1: program all fixed BARs and claim them */
+    {
+        VirtPciProgramCtx pctx = {
+            .cfg = cfg,
+            .phase = PCI_PHASE_CLAIM_AND_PROGRAM_FIXED_BARS,
+            .had_fixed = g_hash_table_new(NULL, NULL),
+        };
+        pci_for_each_bus(bus, pci_bus_program_bars_phase, &pctx);
+
+        /* Phase 2: pack remaining bars for devices that had fixed BARs */
+        pctx.phase = PCI_PHASE_PACK_BARS_FOR_FIXED_BAR_DEVICES;
+        pci_for_each_bus(bus, pci_bus_program_bars_phase, &pctx);
+
+        /* Phase 3: pack bars for devices with no pci-boot-config */
+        pctx.phase = PCI_PHASE_PACK_BARS_FOR_NON_FIXED_DEVICES;
+        pci_for_each_bus(bus, pci_bus_program_bars_phase, &pctx);
+
+        g_hash_table_destroy(pctx.had_fixed);
+    }
+    /* Validate: detect any global device-level 64-bit prefetchable span overlaps */
+    // TODO
+    //
+    if (!cfg->preserve_config) {
+        /* Cleanup */
+        virt_fixed_claims_reset();
+        warn_report("acpi/mmio64: allocator end ");
+        return;
+    }
+
+    memset(ncfg, 0, sizeof(VirtPciAllocCfg));
+    ncfg->cfg = cfg;
+
+    /* TODO: 32-bit MMIO/ROM adjustment */
+
+    /* TODO: PIO assignment */
+
+    /* TODO: 64-bit non-pretetcable */
+
+
+    pci_get_bridge_window(bus, ncfg);
+
+    QLIST_FOREACH(bus, &bus->child, sibling) {
+        ncfg->bus = bus;
+        /* Use the full mmio64 window */
+        ncfg->wbase64 = cfg->mmio64.base;
+        ncfg->wlimit64 = cfg->mmio64.base + cfg->mmio64.size - 1;
+
+        pci_for_each_bus(bus, pci_bus_update_prefetch_window, ncfg);
+        pci_for_each_bus(bus, pci_bus_check_unassigned_mmio64, ncfg);
+    }
+    /* Cleanup */
+    virt_fixed_claims_reset();
+    warn_report("acpi/mmio64: allocator end");
+}
+
 static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
-                              uint32_t irq, VirtMachineState *vms)
+                              uint32_t irq, VirtMachineState *vms, bool update)
 {
     int ecam_id = VIRT_ECAM_ID(vms->highmem_ecam);
     bool cxl_present = false;
@@ -171,8 +744,39 @@ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
         cfg.preserve_config = true;
     }
 
+    /* Determine if any PCI device requested fixed BAR GPAs */
+    bool any_fixed_bar = false;
+    if (vms->bus) {
+        GQueue q = G_QUEUE_INIT;
+        g_queue_push_tail(&q, vms->bus);
+        while (!g_queue_is_empty(&q)) {
+            PCIBus *b = g_queue_pop_head(&q);
+            for (int devfn = 0; devfn < ARRAY_SIZE(b->devices); devfn++) {
+                PCIDevice *pdev = b->devices[devfn];
+                if (pdev && pdev->fixed_bar_pci_boot_config) {
+                    any_fixed_bar = true;
+                    break;
+                }
+            }
+            if (any_fixed_bar) {
+                break;
+            }
+            PCIBus *child;
+            QLIST_FOREACH(child, &b->child, sibling) {
+                g_queue_push_tail(&q, child);
+            }
+        }
+    }
+
     if (vms->highmem_mmio) {
         cfg.mmio64 = memmap[VIRT_HIGH_PCIE_MMIO];
+
+        /* Run the allocator before firmware (initial build only). */
+        if (any_fixed_bar && update) {
+            pci_fixed_bar_allocator(&cfg);
+	    // tdave: intentional exit , after we have new redesign we remove this exit().
+	    exit(1);
+        }
     }
 
     acpi_dsdt_add_gpex(scope, &cfg);
@@ -1143,7 +1747,7 @@ static int acpi_dsdt_add_cmdqv(Aml *scope, GArray *smmuv3_devs)
 
 /* DSDT */
 static void
-build_dsdt(GArray *table_data, AcpiBuildTables *tables, VirtMachineState *vms)
+build_dsdt(GArray *table_data, AcpiBuildTables *tables, VirtMachineState *vms, bool update)
 {
     VirtMachineClass *vmc = VIRT_MACHINE_GET_CLASS(vms);
     GArray *smmuv3_devs = tables->smmuv3_devs;
@@ -1179,7 +1783,7 @@ build_dsdt(GArray *table_data, AcpiBuildTables *tables, VirtMachineState *vms)
     virtio_acpi_dsdt_add(scope, memmap[VIRT_MMIO].base, memmap[VIRT_MMIO].size,
                          (irqmap[VIRT_MMIO] + ARM_SPI_BASE),
                          0, NUM_VIRTIO_TRANSPORTS);
-    acpi_dsdt_add_pci(scope, memmap, irqmap[VIRT_PCIE] + ARM_SPI_BASE, vms);
+    acpi_dsdt_add_pci(scope, memmap, irqmap[VIRT_PCIE] + ARM_SPI_BASE, vms, update);
     if (vms->acpi_dev) {
         build_ged_aml(scope, "\\_SB."GED_DEVICE,
                       HOTPLUG_HANDLER(vms->acpi_dev),
@@ -1274,7 +1878,7 @@ static void virt_acpi_prebuild(VirtMachineState *vms, AcpiBuildTables *tables)
 }
 
 static
-void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
+void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables, bool update)
 {
     VirtMachineClass *vmc = VIRT_MACHINE_GET_CLASS(vms);
     GArray *table_offsets;
@@ -1292,7 +1896,7 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
 
     /* DSDT is pointed to by FADT */
     dsdt = tables_blob->len;
-    build_dsdt(tables_blob, tables, vms);
+    build_dsdt(tables_blob, tables, vms, update);
 
     /* FADT MADT PPTT GTDT MCFG SPCR DBG2 pointed to by RSDT */
     acpi_add_table(table_offsets, tables_blob);
@@ -1438,7 +2042,7 @@ static void virt_acpi_build_update(void *build_opaque)
 
     acpi_build_tables_init(&tables);
 
-    virt_acpi_build(VIRT_MACHINE(qdev_get_machine()), &tables);
+    virt_acpi_build(VIRT_MACHINE(qdev_get_machine()), &tables, true);
 
     acpi_ram_update(build_state->table_mr, tables.table_data);
     acpi_ram_update(build_state->rsdp_mr, tables.rsdp);
@@ -1482,7 +2086,7 @@ void virt_acpi_setup(VirtMachineState *vms)
     build_state = g_malloc0(sizeof *build_state);
 
     acpi_build_tables_init(&tables);
-    virt_acpi_build(vms, &tables);
+    virt_acpi_build(vms, &tables, false);
 
     /* Now expose it all to Guest */
     build_state->table_mr = acpi_add_rom_blob(virt_acpi_build_update,
