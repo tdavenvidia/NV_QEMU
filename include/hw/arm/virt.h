@@ -193,7 +193,10 @@ struct VirtMachineState {
 #define TYPE_VIRT_MACHINE   MACHINE_TYPE_NAME("virt")
 OBJECT_DECLARE_TYPE(VirtMachineState, VirtMachineClass, VIRT_MACHINE)
 
+struct PCIBus;
 void virt_acpi_setup(VirtMachineState *vms);
+void virt_pci_enumerate_bus(struct PCIBus *root_bus);
+void virt_acpi_pci_after_reset(VirtMachineState *vms);
 bool virt_is_acpi_enabled(VirtMachineState *vms);
 
 /* Return number of redistributors that fit in the specified region */

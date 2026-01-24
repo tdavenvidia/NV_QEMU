@@ -49,6 +49,8 @@
 #include "hw/cxl/cxl.h"
 #include "hw/pci/pcie_host.h"
 #include "hw/pci/pci.h"
+#include "hw/vfio/pci.h"
+#include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/arm/virt.h"
@@ -56,6 +58,8 @@
 #include "hw/mem/nvdimm.h"
 #include "hw/platform-bus.h"
 #include "system/numa.h"
+#include "system/device_tree.h"
+#include "libfdt.h"
 #include "system/reset.h"
 #include "system/tpm.h"
 #include "migration/vmstate.h"
@@ -63,6 +67,7 @@
 #include "hw/acpi/viot.h"
 #include "hw/virtio/virtio-acpi.h"
 #include "target/arm/multiprocessing.h"
+#include "hw/arm/virt-pci-resource.h"
 
 #define ARM_SPI_BASE 32
 
@@ -138,6 +143,38 @@ static void build_acpi0017(Aml *table)
 
     aml_append(scope, dev);
     aml_append(table, scope);
+}
+
+/* Re-apply bus numbers then PCI allocator after cold reset so QEMU logs (acpi/mmio64,
+ * virt_pci_bridge, virt_pci) show correct BDFs. Call from the machine reset handler. */
+void virt_acpi_pci_after_reset(VirtMachineState *vms)
+{
+    int ecam_id = VIRT_ECAM_ID(vms->highmem_ecam);
+    bool acpi_pcihp = false;
+    struct GPEXConfig cfg = {
+        .mmio32 = vms->memmap[VIRT_PCIE_MMIO],
+        .pio    = vms->memmap[VIRT_PCIE_PIO],
+        .ecam   = vms->memmap[ecam_id],
+        .irq    = vms->irqmap[VIRT_PCIE] + ARM_SPI_BASE,
+        .bus    = vms->bus,
+        .pci_native_hotplug = true,
+    };
+
+    if (vms->acpi_dev) {
+        acpi_pcihp = object_property_get_bool(OBJECT(vms->acpi_dev),
+                                              ACPI_PM_PROP_ACPI_PCIHP_BRIDGE,
+                                              NULL);
+        cfg.pci_native_hotplug = !acpi_pcihp;
+    }
+    if (vms->pci_preserve_config) {
+        cfg.preserve_config = true;
+    }
+    /* Program bus numbers first so allocator phase logs show correct BDFs */
+    virt_pci_enumerate_bus(vms->bus);
+    if (vms->highmem_mmio) {
+        cfg.mmio64 = vms->memmap[VIRT_HIGH_PCIE_MMIO];
+        pci_fixed_bar_allocator(&cfg, vms);
+    }
 }
 
 static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
