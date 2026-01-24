@@ -391,18 +391,31 @@ static void pci_bus_add_demand_bytes(PCIBus *bus, uint64_t bytes, BusDemandCtx *
     *p += bytes;
 }
 
+/* Helper: check if a BAR is 64-bit prefetchable (what we allocate) */
+static inline bool is_64bit_pref_bar(PCIIORegion *r)
+{
+    if (!r->size) {
+        return false;
+    }
+    if (r->type & PCI_BASE_ADDRESS_SPACE_IO) {
+        return false;
+    }
+    if (!(r->type & PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+        return false;
+    }
+    if (!(r->type & PCI_BASE_ADDRESS_MEM_PREFETCH)) {
+        return false;
+    }
+    return true;
+}
+
 static void pci_collect_bus_pref64_demand_dev(PCIBus *bus, PCIDevice *dev, void *opaque)
 {
     BusDemandCtx *bdc = (BusDemandCtx *)opaque;
     for (int idx = 0; idx < PCI_ROM_SLOT; idx++) {
         PCIIORegion *r = &dev->io_regions[idx];
-        if (!r->size) {
+        if (!is_64bit_pref_bar(r)) {
             continue;
-        }
-        if ((r->type & PCI_BASE_ADDRESS_SPACE_IO) ||
-            !(r->type & PCI_BASE_ADDRESS_MEM_TYPE_64) ||
-            !(r->type & PCI_BASE_ADDRESS_MEM_PREFETCH)) {
-            continue; /* we only count 64-bit PREF demand here */
         }
         /* If this BAR was fixed by pci-boot-config, it's already placed (no demand). */
         if (dev->fixed_bar_pci_boot_config &&
@@ -442,6 +455,23 @@ static void pci_debug_print_bus_pref64_demand(PCIBus *root)
 
 
 
+
+/* BAR entry for Phase 2/3 packing */
+typedef struct {
+    PCIDevice *dev;
+    int bar_idx;
+    uint64_t size;
+} BarEntry;
+
+/* Comparison function for sorting BARs by descending size */
+static int compare_bar_size_desc(gconstpointer a, gconstpointer b)
+{
+    const BarEntry *ba = (const BarEntry *)a;
+    const BarEntry *bb = (const BarEntry *)b;
+    if (ba->size > bb->size) return -1;
+    if (ba->size < bb->size) return 1;
+    return 0;
+}
 
 /* Three-phase programming context */
 typedef enum {
@@ -524,9 +554,93 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         warn_report("acpi/mmio64: phase2 (pack-fixed-dev) dev [%02x:%02x.%x] %s",
                     pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
                     dev->name);
-        /*
-         * Phase 2 seeding policy:
-         */
+        
+        /* Calculate total demand for all devices on this bus */
+        PCIBus *this_bus = pci_get_bus(dev);
+        uint64_t total_demand = 0;
+        uint64_t min_addr = UINT64_MAX;
+        uint64_t max_addr = 0;
+        
+        /* First pass: sum all BAR sizes and find fixed BAR range */
+        for (int devfn = 0; devfn < ARRAY_SIZE(this_bus->devices); devfn++) {
+            PCIDevice *d = this_bus->devices[devfn];
+            if (!d) {
+                continue;
+            }
+            for (int i = 0; i < PCI_ROM_SLOT; i++) {
+                PCIIORegion *r = &d->io_regions[i];
+                if (!is_64bit_pref_bar(r)) {
+                    continue;
+                }
+                
+                /* Check if this is a fixed BAR */
+                if (d->fixed_bar_pci_boot_config &&
+                    d->fixed_bar_pci_boot_config_addr[i] != PCI_BAR_UNMAPPED) {
+                    uint64_t fixed_start = d->fixed_bar_pci_boot_config_addr[i];
+                    uint64_t fixed_end = fixed_start + r->size - 1;
+                    min_addr = MIN(min_addr, fixed_start);
+                    max_addr = MAX(max_addr, fixed_end);
+                }
+                
+                total_demand += r->size;
+            }
+        }
+        
+        /* Build sorted list of remaining (non-fixed) BARs for this bus */
+        GArray *remaining_bars = g_array_new(false, false, sizeof(BarEntry));
+        for (int devfn = 0; devfn < ARRAY_SIZE(this_bus->devices); devfn++) {
+            PCIDevice *d = this_bus->devices[devfn];
+            if (!d || !g_hash_table_contains(pctx->had_fixed, d)) {
+                continue;
+            }
+            for (int i = 0; i < PCI_ROM_SLOT; i++) {
+                PCIIORegion *r = &d->io_regions[i];
+                if (!is_64bit_pref_bar(r)) {
+                    continue;
+                }
+                /* Skip if this is a fixed BAR */
+                if (d->fixed_bar_pci_boot_config &&
+                    d->fixed_bar_pci_boot_config_addr[i] != PCI_BAR_UNMAPPED) {
+                    continue;
+                }
+                
+                BarEntry entry = { .dev = d, .bar_idx = i, .size = r->size };
+                g_array_append_val(remaining_bars, entry);
+            }
+        }
+        
+        /* Sort remaining BARs in descending size order to avoid fragmentation */
+        g_array_sort(remaining_bars, compare_bar_size_desc);
+        
+        /* If we have remaining BARs, compute minimum window that includes fixed + packed */
+        if (remaining_bars->len > 0) {
+            /* For now, just report the requirement - actual packing comes next */
+            warn_report("acpi/mmio64: phase2 bus [%02x] total_demand=0x%"PRIx64" bytes, "
+                        "remaining_bars=%u, sorted by descending size",
+                        pci_bus_num(this_bus), total_demand, remaining_bars->len);
+            
+            for (guint i = 0; i < remaining_bars->len; i++) {
+                BarEntry *e = &g_array_index(remaining_bars, BarEntry, i);
+                warn_report("acpi/mmio64: phase2   remaining BAR [%02x:%02x.%x] BAR%d size=0x%"PRIx64,
+                            pci_dev_bus_num(e->dev), PCI_SLOT(e->dev->devfn), 
+                            PCI_FUNC(e->dev->devfn), e->bar_idx, e->size);
+            }
+        }
+        
+        /* Compute minimum window range [start, end] */
+        if (min_addr != UINT64_MAX) {
+            /* We have at least one fixed BAR, window must contain it */
+            warn_report("acpi/mmio64: phase2 bus [%02x] minimum window for fixed BARs: "
+                        "[0x%"PRIx64"..0x%"PRIx64"] size=0x%"PRIx64,
+                        pci_bus_num(this_bus), min_addr, max_addr, max_addr - min_addr + 1);
+            
+            /* TODO: Extend window to include packed remaining BARs */
+            warn_report("acpi/mmio64: phase2 bus [%02x] total window required: "
+                        "[0x%"PRIx64"..0x%"PRIx64"+packed] total_demand=0x%"PRIx64,
+                        pci_bus_num(this_bus), min_addr, max_addr, total_demand);
+        }
+        
+        g_array_free(remaining_bars, true);
         
 	/* Program packed BARs */
         //pci_program_pbars(dev, pbars, cfg);
