@@ -489,6 +489,16 @@ static int compare_bar_size_desc(gconstpointer a, gconstpointer b)
     return 0;
 }
 
+/* Comparison function for sorting claims by start address */
+static int compare_claim_start(gconstpointer a, gconstpointer b)
+{
+    const FixedClaim *ca = (const FixedClaim *)a;
+    const FixedClaim *cb = (const FixedClaim *)b;
+    if (ca->start < cb->start) return -1;
+    if (ca->start > cb->start) return 1;
+    return 0;
+}
+
 /* Helper: compute holes between fixed BARs within mmio window */
 static GArray* compute_holes(GArray *fixed_bars, uint64_t mmio_start, uint64_t mmio_end)
 {
@@ -532,69 +542,93 @@ static GArray* compute_holes(GArray *fixed_bars, uint64_t mmio_start, uint64_t m
 static GArray* subtract_claims_from_interval(uint64_t hole_start, uint64_t hole_end)
 {
     GArray *free_intervals = g_array_new(false, false, sizeof(AddressInterval));
-    
+
     if (!virt_fixed_claims || virt_fixed_claims->len == 0) {
         /* No claims: entire hole is free */
         AddressInterval free = { .start = hole_start, .end = hole_end };
         g_array_append_val(free_intervals, free);
         return free_intervals;
     }
-    
-    uint64_t scan = hole_start;
-    
+
+    /* Collect overlapping claims and sort them by start address */
+    GArray *overlapping = g_array_new(false, false, sizeof(FixedClaim));
+
     for (guint i = 0; i < virt_fixed_claims->len; i++) {
         FixedClaim *c = &g_array_index(virt_fixed_claims, FixedClaim, i);
-        
+
         /* Skip claims that don't overlap this hole */
         if (c->end < hole_start || c->start > hole_end) {
             continue;
         }
-        
+
+        g_array_append_val(overlapping, *c);
+    }
+
+    /* Sort overlapping claims by start address */
+    g_array_sort(overlapping, compare_claim_start);
+
+    /* Scan and create free intervals */
+    uint64_t scan = hole_start;
+
+    for (guint i = 0; i < overlapping->len; i++) {
+        FixedClaim *c = &g_array_index(overlapping, FixedClaim, i);
+
         /* Free region before this claim */
         if (scan < c->start) {
             AddressInterval free = { .start = scan, .end = c->start - 1 };
             g_array_append_val(free_intervals, free);
         }
-        
+
         /* Move scan past this claim */
         scan = MAX(scan, c->end + 1);
     }
-    
+
     /* Remaining free region after all claims */
     if (scan <= hole_end) {
         AddressInterval free = { .start = scan, .end = hole_end };
         g_array_append_val(free_intervals, free);
     }
-    
+
+    g_array_free(overlapping, true);
     return free_intervals;
 }
 
-/* Helper: find largest contiguous free interval that can fit demand */
-static bool find_largest_free_interval(GArray *free_intervals, uint64_t demand,
-                                       uint64_t *out_start, uint64_t *out_end)
+/* Helper: find best contiguous free interval that can fit demand 
+ * Strategy: prefer intervals closest to the anchor (fixed BAR)
+ *   - For RIGHT hole: prefer leftmost (first) = adjacent after anchor
+ *   - For LEFT hole: prefer rightmost (last) = adjacent before anchor
+ */
+static bool find_best_free_interval(GArray *free_intervals, uint64_t demand,
+                                    bool prefer_leftmost,
+                                    uint64_t *out_start, uint64_t *out_end)
 {
-    uint64_t largest_size = 0;
-    uint64_t largest_start = 0;
-    uint64_t largest_end = 0;
-    
-    for (guint i = 0; i < free_intervals->len; i++) {
-        AddressInterval *interval = &g_array_index(free_intervals, AddressInterval, i);
-        uint64_t size = interval->end - interval->start + 1;
-        
-        if (size >= demand && size > largest_size) {
-            largest_size = size;
-            largest_start = interval->start;
-            largest_end = interval->end;
+    if (prefer_leftmost) {
+        /* Prefer leftmost (first) interval - for RIGHT holes (after anchor) */
+        for (guint i = 0; i < free_intervals->len; i++) {
+            AddressInterval *interval = &g_array_index(free_intervals, AddressInterval, i);
+            uint64_t size = interval->end - interval->start + 1;
+
+            if (size >= demand) {
+                *out_start = interval->start;
+                *out_end = interval->end;
+                return true;
+            }
         }
+        return false;
+    } else {
+        /* Prefer rightmost (last) interval - for LEFT holes (before anchor) */
+        for (int i = free_intervals->len - 1; i >= 0; i--) {
+            AddressInterval *interval = &g_array_index(free_intervals, AddressInterval, (guint)i);
+            uint64_t size = interval->end - interval->start + 1;
+
+            if (size >= demand) {
+                *out_start = interval->start;
+                *out_end = interval->end;
+                return true;
+            }
+        }
+        return false;
     }
-    
-    if (largest_size >= demand) {
-        *out_start = largest_start;
-        *out_end = largest_end;
-        return true;
-    }
-    
-    return false;
 }
 
 /* Helper: pack BARs into a given region and return window bounds */
@@ -745,19 +779,24 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         /* Single pass: collect both fixed and remaining BARs */
         GArray *fixed_bars = g_array_new(false, false, sizeof(AddressInterval));
         GArray *remaining_bars = g_array_new(false, false, sizeof(BarEntry));
-        
+
         for (int devfn = 0; devfn < ARRAY_SIZE(this_bus->devices); devfn++) {
             PCIDevice *d = this_bus->devices[devfn];
-            if (!d || !g_hash_table_contains(pctx->had_fixed, d)) {
+            if (!d) {
                 continue;
             }
+
+            /* Collect fixed BARs only from devices that have pci-boot-config */
+            bool device_has_fixed = g_hash_table_contains(pctx->had_fixed, d);
+
             for (int i = 0; i < PCI_ROM_SLOT; i++) {
                 PCIIORegion *r = &d->io_regions[i];
                 if (!is_64bit_pref_bar(r)) {
                     continue;
                 }
-                
-                if (d->fixed_bar_pci_boot_config &&
+
+                if (device_has_fixed &&
+                    d->fixed_bar_pci_boot_config &&
                     d->fixed_bar_pci_boot_config_addr[i] != PCI_BAR_UNMAPPED) {
                     /* Fixed BAR: collect for hole computation */
                     AddressInterval interval = {
@@ -766,7 +805,7 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
                     };
                     g_array_append_val(fixed_bars, interval);
                 } else {
-                    /* Remaining BAR: collect for packing */
+                    /* Remaining BAR: collect for packing (from ALL devices on this bus) */
                     BarEntry entry = { .dev = d, .bar_idx = i, .size = r->size };
                     g_array_append_val(remaining_bars, entry);
                 }
@@ -811,12 +850,18 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         for (int h = holes->len - 1; h >= 0; h--) {
             AddressInterval *hole = &g_array_index(holes, AddressInterval, (guint)h);
             GArray *free_intervals = subtract_claims_from_interval(hole->start, hole->end);
-            
-            if (find_largest_free_interval(free_intervals, remaining_demand, &pack_start, &pack_end)) {
+
+            /* Prefer intervals closest to anchor:
+             * - RIGHT hole: prefer leftmost (adjacent after anchor)
+             * - LEFT holes: prefer rightmost (adjacent before anchor) */
+            bool is_rightmost = (h == (int)holes->len - 1);
+            bool prefer_leftmost = is_rightmost;
+
+            if (find_best_free_interval(free_intervals, remaining_demand, prefer_leftmost,
+                                        &pack_start, &pack_end)) {
                 found_space = true;
-                
+
                 /* If not the rightmost hole, pack from END (adjacent to next fixed BAR) */
-                bool is_rightmost = (h == (int)holes->len - 1);
                 if (!is_rightmost) {
                     /* Pack backwards from end of hole to stay adjacent to fixed BAR */
                     uint64_t hole_end_for_packing = pack_end;
@@ -830,10 +875,10 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
                                 pci_bus_num(this_bus), h, pack_start, pack_end);
                 } else {
                     warn_report("acpi/mmio64: phase2 bus [%02x] packing RIGHT in hole %d: "
-                                "[0x%"PRIx64"..0x%"PRIx64"]",
+                                "[0x%"PRIx64"..0x%"PRIx64"] (adjacent to anchor)",
                                 pci_bus_num(this_bus), h, pack_start, pack_end);
                 }
-                
+
                 g_array_free(free_intervals, true);
                 break;
             }
