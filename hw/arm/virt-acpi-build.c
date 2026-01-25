@@ -612,9 +612,8 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         /* Sort remaining BARs in descending size order to avoid fragmentation */
         g_array_sort(remaining_bars, compare_bar_size_desc);
         
-        /* If we have remaining BARs, compute minimum window that includes fixed + packed */
+        /* If we have remaining BARs, pack them around the fixed BARs */
         if (remaining_bars->len > 0) {
-            /* For now, just report the requirement - actual packing comes next */
             warn_report("acpi/mmio64: phase2 bus [%02x] total_demand=0x%"PRIx64" bytes, "
                         "remaining_bars=%u, sorted by descending size",
                         pci_bus_num(this_bus), total_demand, remaining_bars->len);
@@ -625,25 +624,135 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
                             pci_dev_bus_num(e->dev), PCI_SLOT(e->dev->devfn), 
                             PCI_FUNC(e->dev->devfn), e->bar_idx, e->size);
             }
+            
+            /* Calculate remaining demand (excluding fixed BARs) */
+            uint64_t remaining_demand = 0;
+            for (guint i = 0; i < remaining_bars->len; i++) {
+                BarEntry *e = &g_array_index(remaining_bars, BarEntry, i);
+                remaining_demand += e->size;
+            }
+            
+            /* Compute left and right capacity around fixed BARs */
+            uint64_t mmio_start = cfg->mmio64.base;
+            uint64_t mmio_end = cfg->mmio64.base + cfg->mmio64.size - 1;
+            uint64_t left_capacity = 0;
+            uint64_t right_capacity = 0;
+            
+            if (min_addr != UINT64_MAX) {
+                /* We have fixed BARs - compute capacity on both sides */
+                left_capacity = min_addr - mmio_start;
+                right_capacity = mmio_end - max_addr;
+                
+                warn_report("acpi/mmio64: phase2 bus [%02x] fixed BAR range: "
+                            "[0x%"PRIx64"..0x%"PRIx64"]",
+                            pci_bus_num(this_bus), min_addr, max_addr);
+                warn_report("acpi/mmio64: phase2 bus [%02x] left_capacity=0x%"PRIx64" "
+                            "right_capacity=0x%"PRIx64" remaining_demand=0x%"PRIx64,
+                            pci_bus_num(this_bus), left_capacity, right_capacity, remaining_demand);
+            }
+            
+            /* Choose packing side: prefer right, but check capacity */
+            bool pack_right = true;
+            if (remaining_demand > right_capacity && remaining_demand <= left_capacity) {
+                pack_right = false;
+                warn_report("acpi/mmio64: phase2 bus [%02x] packing LEFT (right insufficient)",
+                            pci_bus_num(this_bus));
+            } else if (remaining_demand > right_capacity && remaining_demand > left_capacity) {
+                error_report("acpi/mmio64: phase2 bus [%02x] insufficient space: "
+                             "remaining_demand=0x%"PRIx64" left=0x%"PRIx64" right=0x%"PRIx64,
+                             pci_bus_num(this_bus), remaining_demand, left_capacity, right_capacity);
+                g_array_free(remaining_bars, true);
+                exit(1);
+            } else {
+                warn_report("acpi/mmio64: phase2 bus [%02x] packing RIGHT",
+                            pci_bus_num(this_bus));
+            }
+            
+            /* Pack and program remaining BARs (largest first, already sorted) */
+            uint64_t pack_cursor = pack_right ? (max_addr + 1) : (min_addr - remaining_demand);
+            uint64_t bus_min_addr = min_addr;  /* Track min for bridge window */
+            uint64_t bus_max_addr = max_addr;  /* Track max for bridge window */
+            
+            warn_report("acpi/mmio64: phase2 bus [%02x] starting pack at 0x%"PRIx64,
+                        pci_bus_num(this_bus), pack_cursor);
+            
+            for (guint i = 0; i < remaining_bars->len; i++) {
+                BarEntry *e = &g_array_index(remaining_bars, BarEntry, i);
+                PCIIORegion *r = &e->dev->io_regions[e->bar_idx];
+                
+                /* Align address to BAR size */
+                uint64_t aligned_addr = ROUND_UP(pack_cursor, r->size);
+                uint64_t bar_start = aligned_addr;
+                uint64_t bar_end = bar_start + r->size - 1;
+                
+                /* Check for conflicts with global claims */
+                if (virt_fixed_claims_conflicts(bar_start, bar_end,
+                                                cfg->mmio64.base,
+                                                cfg->mmio64.base + cfg->mmio64.size - 1,
+                                                NULL)) {
+                    error_report("acpi/mmio64: phase2 bus [%02x] BAR placement conflict: "
+                                 "[%02x:%02x.%x] BAR%d [0x%"PRIx64"..0x%"PRIx64"]",
+                                 pci_bus_num(this_bus),
+                                 pci_dev_bus_num(e->dev), PCI_SLOT(e->dev->devfn),
+                                 PCI_FUNC(e->dev->devfn), e->bar_idx, bar_start, bar_end);
+                    g_array_free(remaining_bars, true);
+                    exit(1);
+                }
+                
+                /* Program this BAR */
+                PhysBAR pbar_to_program;
+                memset(&pbar_to_program, 0, sizeof(pbar_to_program));
+                pbar_to_program.addr = bar_start;
+                pbar_to_program.end = bar_end;
+                pbar_to_program.flags = IORESOURCE_PREFETCH;
+                
+                PhysBAR pbars_array[PCI_ROM_SLOT];
+                memset(pbars_array, 0, sizeof(pbars_array));
+                pbars_array[e->bar_idx] = pbar_to_program;
+                
+                pci_program_pbars(e->dev, pbars_array, cfg);
+                
+                /* Update bridge window tracking */
+                bus_min_addr = MIN(bus_min_addr, bar_start);
+                bus_max_addr = MAX(bus_max_addr, bar_end);
+                
+                /* Advance cursor for next BAR */
+                pack_cursor = bar_end + 1;
+            }
+            
+            /* Claim the ENTIRE bridge window (not individual BARs) */
+            PCIDevice *bridge_dev = pci_bridge_get_device(this_bus);
+            if (bridge_dev) {
+                /* Non-root bus: claim the bridge window */
+                virt_fixed_claims_add(bus_min_addr, bus_max_addr, bridge_dev, -1);
+                warn_report("acpi/mmio64: phase2 bus [%02x] claimed bridge window: "
+                            "[0x%"PRIx64"..0x%"PRIx64"] size=0x%"PRIx64,
+                            pci_bus_num(this_bus), bus_min_addr, bus_max_addr,
+                            bus_max_addr - bus_min_addr + 1);
+            } else {
+                /* Root bus: claim individual device spans for tracking */
+                warn_report("acpi/mmio64: phase2 bus [%02x] (root) window: "
+                            "[0x%"PRIx64"..0x%"PRIx64"] size=0x%"PRIx64,
+                            pci_bus_num(this_bus), bus_min_addr, bus_max_addr,
+                            bus_max_addr - bus_min_addr + 1);
+            }
+            
+            /* Report final window range */
+            warn_report("acpi/mmio64: phase2 bus [%02x] final window: "
+                        "[0x%"PRIx64"..0x%"PRIx64"] size=0x%"PRIx64,
+                        pci_bus_num(this_bus), bus_min_addr, bus_max_addr,
+                        bus_max_addr - bus_min_addr + 1);
         }
         
         /* Compute minimum window range [start, end] */
-        if (min_addr != UINT64_MAX) {
-            /* We have at least one fixed BAR, window must contain it */
-            warn_report("acpi/mmio64: phase2 bus [%02x] minimum window for fixed BARs: "
+        if (min_addr != UINT64_MAX && remaining_bars->len == 0) {
+            /* Only fixed BARs, no remaining */
+            warn_report("acpi/mmio64: phase2 bus [%02x] window (fixed BARs only): "
                         "[0x%"PRIx64"..0x%"PRIx64"] size=0x%"PRIx64,
                         pci_bus_num(this_bus), min_addr, max_addr, max_addr - min_addr + 1);
-            
-            /* TODO: Extend window to include packed remaining BARs */
-            warn_report("acpi/mmio64: phase2 bus [%02x] total window required: "
-                        "[0x%"PRIx64"..0x%"PRIx64"+packed] total_demand=0x%"PRIx64,
-                        pci_bus_num(this_bus), min_addr, max_addr, total_demand);
         }
         
         g_array_free(remaining_bars, true);
-        
-	/* Program packed BARs */
-        //pci_program_pbars(dev, pbars, cfg);
         break;
     }
     case PCI_PHASE_PACK_BARS_FOR_NON_FIXED_DEVICES: {
