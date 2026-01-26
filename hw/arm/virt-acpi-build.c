@@ -350,6 +350,7 @@ static void pci_program_pbars(PCIDevice *dev, PhysBAR *pbars, struct GPEXConfig 
 
     for (idx = 0; idx < PCI_ROM_SLOT; idx++) {
         PhysBAR *pbar = &pbars[idx];
+        
         if (!(pbar->flags & IORESOURCE_PREFETCH)) {
             continue;
         }
@@ -359,6 +360,8 @@ static void pci_program_pbars(PCIDevice *dev, PhysBAR *pbars, struct GPEXConfig 
         if (dev->io_regions[idx].type & PCI_BASE_ADDRESS_MEM_PREFETCH) {
             laddr |= PCI_BASE_ADDRESS_MEM_PREFETCH;
         }
+        
+        /* Write to physical device config space */
         pci_host_config_write_common(dev,
                                      PCI_BASE_ADDRESS_0 + (idx * 4),
                                      pci_config_size(dev),
@@ -369,6 +372,8 @@ static void pci_program_pbars(PCIDevice *dev, PhysBAR *pbars, struct GPEXConfig 
                                      pci_config_size(dev),
                                      (uint32_t)(pbar->addr >> 32),
                                      4);
+        
+        
         warn_report("acpi/mmio64: programmed %s [%02x:%02x.%x] BAR%d -> 0x%lx",
                     dev->name, pci_dev_bus_num(dev),
                     PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
@@ -489,6 +494,7 @@ static int compare_bar_size_desc(gconstpointer a, gconstpointer b)
     return 0;
 }
 
+#if 0  /* Unused after Phase 2 refactoring - kept for reference */
 /* Comparison function for sorting claims by start address */
 static int compare_claim_start(gconstpointer a, gconstpointer b)
 {
@@ -498,46 +504,114 @@ static int compare_claim_start(gconstpointer a, gconstpointer b)
     if (ca->start > cb->start) return 1;
     return 0;
 }
+#endif  /* Unused after Phase 2 refactoring */
 
-/* Helper: compute holes between fixed BARs within mmio window */
-static GArray* compute_holes(GArray *fixed_bars, uint64_t mmio_start, uint64_t mmio_end)
+/* Categorized holes relative to anchors */
+typedef struct {
+    int leftmost_hole;      /* Index of hole before first anchor, or -1 */
+    GArray *middle_holes;   /* Array of hole indices between anchors */
+    int rightmost_hole;     /* Index of hole after last anchor, or -1 */
+} CategorizedHoles;
+
+/* Helper: categorize holes relative to anchors */
+static CategorizedHoles categorize_holes(GArray *holes, GArray *fixed_bars)
 {
-    GArray *holes = g_array_new(false, false, sizeof(AddressInterval));
+    CategorizedHoles result = {
+        .leftmost_hole = -1,
+        .middle_holes = g_array_new(false, false, sizeof(int)),
+        .rightmost_hole = -1
+    };
     
-    if (fixed_bars->len == 0) {
-        /* No fixed BARs: entire window is one hole */
-        AddressInterval hole = { .start = mmio_start, .end = mmio_end };
-        g_array_append_val(holes, hole);
-        return holes;
-    }
+    /* Get anchor boundaries */
+    uint64_t first_anchor_start = g_array_index(fixed_bars, AddressInterval, 0).start;
+    uint64_t last_anchor_end = g_array_index(fixed_bars, AddressInterval,
+                                               fixed_bars->len - 1).end;
     
-    /* Hole before first fixed BAR */
-    AddressInterval *first = &g_array_index(fixed_bars, AddressInterval, 0);
-    if (first->start > mmio_start) {
-        AddressInterval hole = { .start = mmio_start, .end = first->start - 1 };
-        g_array_append_val(holes, hole);
-    }
-    
-    /* Holes between consecutive fixed BARs */
-    for (guint i = 0; i < fixed_bars->len - 1; i++) {
-        AddressInterval *curr = &g_array_index(fixed_bars, AddressInterval, i);
-        AddressInterval *next = &g_array_index(fixed_bars, AddressInterval, i + 1);
-        if (curr->end + 1 < next->start) {
-            AddressInterval hole = { .start = curr->end + 1, .end = next->start - 1 };
-            g_array_append_val(holes, hole);
+    /* Categorize each hole */
+    for (guint h = 0; h < holes->len; h++) {
+        AddressInterval *hole = &g_array_index(holes, AddressInterval, h);
+        
+        if (hole->end < first_anchor_start) {
+            result.leftmost_hole = h;  /* Before all anchors */
+        } else if (hole->start > last_anchor_end) {
+            result.rightmost_hole = h;  /* After all anchors */
+        } else {
+            g_array_append_val(result.middle_holes, h);  /* Between anchors */
         }
     }
     
-    /* Hole after last fixed BAR */
-    AddressInterval *last = &g_array_index(fixed_bars, AddressInterval, fixed_bars->len - 1);
-    if (last->end < mmio_end) {
-        AddressInterval hole = { .start = last->end + 1, .end = mmio_end };
+    return result;
+}
+
+/* Helper: compute REAL holes considering both local anchors and global claims
+ * This returns actual free space that can be used for packing.
+ * Strategy: Collect all obstacles (local fixed BARs + global claims from other buses),
+ * then compute gaps between them.
+ */
+static GArray* compute_real_holes(GArray *fixed_bars, uint64_t mmio_start, uint64_t mmio_end)
+{
+    GArray *holes = g_array_new(false, false, sizeof(AddressInterval));
+    GArray *claimed_regions = g_array_new(false, false, sizeof(AddressInterval));
+    
+    /* Add local fixed BARs (anchors) as claimed regions */
+    for (guint i = 0; i < fixed_bars->len; i++) {
+        AddressInterval *anchor = &g_array_index(fixed_bars, AddressInterval, i);
+        g_array_append_val(claimed_regions, *anchor);
+    }
+    
+    /* Add global claims from ALL buses (including other buses) */
+    if (virt_fixed_claims) {
+        for (guint i = 0; i < virt_fixed_claims->len; i++) {
+            FixedClaim *claim = &g_array_index(virt_fixed_claims, FixedClaim, i);
+            /* Only consider claims within our MMIO window */
+            if (claim->start <= mmio_end && claim->end >= mmio_start) {
+                AddressInterval region = {
+                    .start = claim->start,
+                    .end = claim->end
+                };
+                g_array_append_val(claimed_regions, region);
+            }
+        }
+    }
+    
+    /* Handle case with no claimed regions */
+    if (claimed_regions->len == 0) {
+        AddressInterval hole = { .start = mmio_start, .end = mmio_end };
+        g_array_append_val(holes, hole);
+        g_array_free(claimed_regions, true);
+        return holes;
+    }
+    
+    /* Sort claimed regions by start address */
+    g_array_sort(claimed_regions, compare_intervals);
+    
+    /* Compute holes between all claimed regions */
+    uint64_t scan = mmio_start;
+    
+    for (guint i = 0; i < claimed_regions->len; i++) {
+        AddressInterval *claimed = &g_array_index(claimed_regions, AddressInterval, i);
+        
+        /* Free space before this claimed region */
+        if (scan < claimed->start) {
+            AddressInterval hole = { .start = scan, .end = claimed->start - 1 };
+            g_array_append_val(holes, hole);
+        }
+        
+        /* Move scan cursor past this claimed region */
+        scan = MAX(scan, claimed->end + 1);
+    }
+    
+    /* Free space after last claimed region */
+    if (scan <= mmio_end) {
+        AddressInterval hole = { .start = scan, .end = mmio_end };
         g_array_append_val(holes, hole);
     }
     
+    g_array_free(claimed_regions, true);
     return holes;
 }
 
+#if 0  /* Unused after Phase 2 refactoring - kept for reference */
 /* Helper: subtract global claims from an interval to get free sub-intervals */
 static GArray* subtract_claims_from_interval(uint64_t hole_start, uint64_t hole_end)
 {
@@ -630,6 +704,7 @@ static bool find_best_free_interval(GArray *free_intervals, uint64_t demand,
         return false;
     }
 }
+#endif  /* Unused after Phase 2 refactoring */
 
 /* Helper: pack BARs into a given region and return window bounds */
 static bool pack_bars_into_region(GArray *bars, uint64_t pack_start, uint64_t pack_end,
@@ -835,66 +910,121 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         warn_report("acpi/mmio64: phase2 bus [%02x] remaining_bars=%u remaining_demand=0x%"PRIx64,
                     pci_bus_num(this_bus), remaining_bars->len, remaining_demand);
         
-        /* Compute holes between fixed BARs */
-        GArray *holes = compute_holes(fixed_bars, mmio_start, mmio_end);
+        /* Compute valid range for THIS bus by finding nearest claims */
+        uint64_t leftmost_anchor = g_array_index(fixed_bars, AddressInterval, 0).start;
+        uint64_t rightmost_anchor_end = g_array_index(fixed_bars, AddressInterval, 
+                                                        fixed_bars->len - 1).end;
         
-        warn_report("acpi/mmio64: phase2 bus [%02x] found %u fixed BARs, %u holes",
-                    pci_bus_num(this_bus), fixed_bars->len, holes->len);
+        uint64_t valid_start = mmio_start;
+        uint64_t valid_end = mmio_end;
         
-        /* Find largest contiguous free interval across all holes */
-        /* Prefer rightmost holes (after last fixed BAR) for tighter bridge windows */
-        uint64_t pack_start = 0, pack_end = 0;
-        bool found_space = false;
-        
-        /* Search holes from right to left (prefer packing after last fixed BAR) */
-        for (int h = holes->len - 1; h >= 0; h--) {
-            AddressInterval *hole = &g_array_index(holes, AddressInterval, (guint)h);
-            GArray *free_intervals = subtract_claims_from_interval(hole->start, hole->end);
-
-            /* Prefer intervals closest to anchor:
-             * - RIGHT hole: prefer leftmost (adjacent after anchor)
-             * - LEFT holes: prefer rightmost (adjacent before anchor) */
-            bool is_rightmost = (h == (int)holes->len - 1);
-            bool prefer_leftmost = is_rightmost;
-
-            if (find_best_free_interval(free_intervals, remaining_demand, prefer_leftmost,
-                                        &pack_start, &pack_end)) {
-                found_space = true;
-
-                /* If not the rightmost hole, pack from END (adjacent to next fixed BAR) */
-                if (!is_rightmost) {
-                    /* Pack backwards from end of hole to stay adjacent to fixed BAR */
-                    uint64_t hole_end_for_packing = pack_end;
-                    pack_start = hole_end_for_packing + 1 - remaining_demand;
-                    /* Align down to avoid going below hole start */
-                    if (pack_start < hole->start) {
-                        pack_start = hole->start;
-                    }
-                    warn_report("acpi/mmio64: phase2 bus [%02x] packing LEFT in hole %d: "
-                                "adjusted to [0x%"PRIx64"..0x%"PRIx64"] (adjacent to fixed BAR)",
-                                pci_bus_num(this_bus), h, pack_start, pack_end);
-                } else {
-                    warn_report("acpi/mmio64: phase2 bus [%02x] packing RIGHT in hole %d: "
-                                "[0x%"PRIx64"..0x%"PRIx64"] (adjacent to anchor)",
-                                pci_bus_num(this_bus), h, pack_start, pack_end);
+        /* Scan global claims to find boundaries */
+        if (virt_fixed_claims) {
+            for (guint i = 0; i < virt_fixed_claims->len; i++) {
+                FixedClaim *claim = &g_array_index(virt_fixed_claims, FixedClaim, i);
+                
+                /* Find highest claim ending before our leftmost anchor */
+                if (claim->end < leftmost_anchor && claim->end >= valid_start) {
+                    valid_start = claim->end + 1;
                 }
-
-                g_array_free(free_intervals, true);
-                break;
+                
+                /* Find lowest claim starting after our rightmost anchor */
+                if (claim->start > rightmost_anchor_end && claim->start <= valid_end) {
+                    valid_end = claim->start - 1;
+                }
             }
-            g_array_free(free_intervals, true);
         }
         
-        g_array_free(holes, true);
+        warn_report("acpi/mmio64: phase2 bus [%02x] valid_range=[0x%"PRIx64"..0x%"PRIx64"] "
+                    "anchors=[0x%"PRIx64"..0x%"PRIx64"]",
+                    pci_bus_num(this_bus), valid_start, valid_end, 
+                    leftmost_anchor, rightmost_anchor_end);
         
-        if (!found_space) {
+        /* Compute REAL holes within THIS bus's valid range */
+        GArray *holes = compute_real_holes(fixed_bars, valid_start, valid_end);
+        
+        warn_report("acpi/mmio64: phase2 bus [%02x] found %u fixed BARs, %u real holes",
+                    pci_bus_num(this_bus), fixed_bars->len, holes->len);
+        
+        /* Categorize holes: leftmost (before first anchor), middle, rightmost (after last anchor) */
+        CategorizedHoles cat = categorize_holes(holes, fixed_bars);
+        
+        /* Strategy: Try largest middle hole first, then rightmost, then leftmost */
+        int selected_hole = -1;
+        uint64_t pack_start = 0, pack_end = 0;
+        const char *hole_type = NULL;
+        
+        /* 1. Try largest middle hole first (optimal for bridge window) */
+        if (cat.middle_holes->len > 0) {
+            int largest_middle = -1;
+            uint64_t largest_size = 0;
+            
+            for (guint i = 0; i < cat.middle_holes->len; i++) {
+                int h = g_array_index(cat.middle_holes, int, i);
+                AddressInterval *hole = &g_array_index(holes, AddressInterval, h);
+                uint64_t hole_size = hole->end - hole->start + 1;
+                
+                if (hole_size >= remaining_demand && hole_size > largest_size) {
+                    largest_size = hole_size;
+                    largest_middle = h;
+                }
+            }
+            
+            if (largest_middle >= 0) {
+                selected_hole = largest_middle;
+                hole_type = "MIDDLE";
+                warn_report("acpi/mmio64: phase2 bus [%02x] selected largest MIDDLE hole %d (size=0x%"PRIx64")",
+                            pci_bus_num(this_bus), selected_hole, largest_size);
+            }
+        }
+        
+        /* 2. Try rightmost hole (after last anchor) */
+        if (selected_hole < 0 && cat.rightmost_hole >= 0) {
+            AddressInterval *hole = &g_array_index(holes, AddressInterval, cat.rightmost_hole);
+            uint64_t hole_size = hole->end - hole->start + 1;
+            
+            if (hole_size >= remaining_demand) {
+                selected_hole = cat.rightmost_hole;
+                hole_type = "RIGHT";
+                warn_report("acpi/mmio64: phase2 bus [%02x] selected RIGHTMOST hole %d (size=0x%"PRIx64")",
+                            pci_bus_num(this_bus), selected_hole, hole_size);
+            }
+        }
+        
+        /* 3. Try leftmost hole (before first anchor) as last resort */
+        if (selected_hole < 0 && cat.leftmost_hole >= 0) {
+            AddressInterval *hole = &g_array_index(holes, AddressInterval, cat.leftmost_hole);
+            uint64_t hole_size = hole->end - hole->start + 1;
+            
+            if (hole_size >= remaining_demand) {
+                selected_hole = cat.leftmost_hole;
+                hole_type = "LEFT";
+                warn_report("acpi/mmio64: phase2 bus [%02x] selected LEFTMOST hole %d (size=0x%"PRIx64")",
+                            pci_bus_num(this_bus), selected_hole, hole_size);
+            }
+        }
+        
+        g_array_free(cat.middle_holes, true);
+        
+        if (selected_hole < 0) {
             error_report("acpi/mmio64: phase2 bus [%02x] insufficient contiguous space for "
                          "remaining_demand=0x%"PRIx64,
                          pci_bus_num(this_bus), remaining_demand);
+            g_array_free(holes, true);
             g_array_free(fixed_bars, true);
             g_array_free(remaining_bars, true);
             exit(1);
         }
+        
+        /* Pack in selected hole */
+        AddressInterval *selected = &g_array_index(holes, AddressInterval, selected_hole);
+        pack_start = selected->start;
+        pack_end = selected->end;
+        
+        warn_report("acpi/mmio64: phase2 bus [%02x] packing %s in hole %d: [0x%"PRIx64"..0x%"PRIx64"]",
+                    pci_bus_num(this_bus), hole_type, selected_hole, pack_start, pack_end);
+        
+        g_array_free(holes, true);
         
         /* Pack and program BARs (largest first) */
         uint64_t bus_min_addr, bus_max_addr;
@@ -1163,7 +1293,7 @@ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
         if (any_fixed_bar && update) {
             pci_fixed_bar_allocator(&cfg);
 	    // tdave: intentional exit , after we have new redesign we remove this exit().
-	    exit(1);
+//	    exit(1);
         }
     }
 
@@ -2445,6 +2575,68 @@ static void virt_acpi_build_reset(void *build_opaque)
     build_state->patched = false;
 }
 
+
+#if 0
+/* Reset callback to reprogram VFIO device BARs after device reset */
+void virt_reprogram_vfio_bars_on_reset(void *opaque)
+{
+    VirtMachineState *vms = opaque;
+    
+    if (!vms->bus) {
+        return;
+    }
+    
+    warn_report("virt_reprogram_vfio_bars_on_reset: Checking and reprogramming BARs after reset");
+    
+    GQueue q = G_QUEUE_INIT;
+    g_queue_push_tail(&q, vms->bus);
+    while (!g_queue_is_empty(&q)) {
+        PCIBus *b = g_queue_pop_head(&q);
+        for (int devfn = 0; devfn < ARRAY_SIZE(b->devices); devfn++) {
+            PCIDevice *pdev = b->devices[devfn];
+            if (pdev && pdev->fixed_bar_pci_boot_config) {
+                /* Reprogram all fixed BARs */
+                for (int idx = 0; idx < PCI_ROM_SLOT; idx++) {
+                    if (pdev->fixed_bar_pci_boot_config_addr[idx] != PCI_BAR_UNMAPPED) {
+                        uint64_t addr = pdev->fixed_bar_pci_boot_config_addr[idx];
+                        uint32_t laddr = (addr & PCI_BASE_ADDRESS_MEM_MASK) | PCI_BASE_ADDRESS_MEM_TYPE_64;
+                        
+                        if (pdev->io_regions[idx].type & PCI_BASE_ADDRESS_MEM_PREFETCH) {
+                            laddr |= PCI_BASE_ADDRESS_MEM_PREFETCH;
+                        }
+                        
+                        /* Write to physical device */
+                        pci_host_config_write_common(pdev,
+                                                     PCI_BASE_ADDRESS_0 + (idx * 4),
+                                                     pci_config_size(pdev),
+                                                     laddr,
+                                                     4);
+                        pci_host_config_write_common(pdev,
+                                                     PCI_BASE_ADDRESS_0 + (idx * 4) + 4,
+                                                     pci_config_size(pdev),
+                                                     (uint32_t)(addr >> 32),
+                                                     4);
+                        
+                        /* Update QEMU internal state */
+                        pci_set_long(pdev->config + PCI_BASE_ADDRESS_0 + (idx * 4), laddr);
+                        pci_set_long(pdev->config + PCI_BASE_ADDRESS_0 + (idx * 4) + 4, (uint32_t)(addr >> 32));
+                        
+                        warn_report("virt_reprogram_vfio_bars_on_reset: reprogrammed %s [%02x:%02x.%x] BAR%d -> 0x%lx",
+                                   pdev->name, pci_dev_bus_num(pdev),
+                                   PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn),
+                                   idx, addr);
+                    }
+                }
+            }
+        }
+        PCIBus *child;
+        QLIST_FOREACH(child, &b->child, sibling) {
+            g_queue_push_tail(&q, child);
+        }
+    }
+}
+#endif
+
 static const VMStateDescription vmstate_virt_acpi_build = {
     .name = "virt_acpi_build",
     .version_id = 1,
@@ -2454,7 +2646,7 @@ static const VMStateDescription vmstate_virt_acpi_build = {
         VMSTATE_END_OF_LIST()
     },
 };
-
+# 
 void virt_acpi_setup(VirtMachineState *vms)
 {
     AcpiBuildTables tables;

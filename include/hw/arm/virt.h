@@ -194,6 +194,7 @@ struct VirtMachineState {
 OBJECT_DECLARE_TYPE(VirtMachineState, VirtMachineClass, VIRT_MACHINE)
 
 void virt_acpi_setup(VirtMachineState *vms);
+//void virt_reprogram_vfio_bars_on_reset(void *opaque);
 bool virt_is_acpi_enabled(VirtMachineState *vms);
 
 /* Return number of redistributors that fit in the specified region */

@@ -44,6 +44,7 @@
 #include "net/net.h"
 #include "system/device_tree.h"
 #include "system/numa.h"
+//#include "system/reset.h"
 #include "system/runstate.h"
 #include "system/tpm.h"
 #include "system/tcg.h"
@@ -1885,6 +1886,8 @@ void virt_machine_done(Notifier *notifier, void *data)
 
     virt_acpi_setup(vms);
     virt_build_smbios(vms);
+    
+    warn_report("virt_machine_done: About to hand control to firmware");
 }
 
 static uint64_t virt_cpu_mp_affinity(VirtMachineState *vms, int idx)
@@ -2604,6 +2607,10 @@ static void machvirt_init(MachineState *machine)
 
     vms->machine_done.notify = virt_machine_done;
     qemu_add_machine_init_done_notifier(&vms->machine_done);
+    
+    /* Register reset handler to reprogram VFIO BARs after device reset.
+     * This runs after VFIO resets devices, ensuring BARs are preserved. */
+//    qemu_register_reset(virt_reprogram_vfio_bars_on_reset, vms);
 }
 
 static bool virt_get_secure(Object *obj, Error **errp)
