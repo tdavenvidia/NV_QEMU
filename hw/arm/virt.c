@@ -44,7 +44,7 @@
 #include "net/net.h"
 #include "system/device_tree.h"
 #include "system/numa.h"
-//#include "system/reset.h"
+#include "system/reset.h"
 #include "system/runstate.h"
 #include "system/tpm.h"
 #include "system/tcg.h"
@@ -1848,6 +1848,11 @@ static void virt_build_smbios(VirtMachineState *vms)
     }
 }
 
+static void virt_pci_program_bus_numbers_after_reset(void *opaque)
+{
+    virt_acpi_pci_after_reset((VirtMachineState *)opaque);
+}
+
 static
 void virt_machine_done(Notifier *notifier, void *data)
 {
@@ -1881,10 +1886,15 @@ void virt_machine_done(Notifier *notifier, void *data)
         exit(1);
     }
 
-    pci_bus_add_fw_cfg_extra_pci_roots(vms->fw_cfg, vms->bus,
-                                       &error_abort);
+    /* Do not expose extra root buses via fw_cfg; firmware sees a single root bridge. */
 
     virt_acpi_setup(vms);
+    /*
+     * Cold reset runs after machine_done and zeros PCI bridge Primary/Secondary/Subordinate.
+     * Re-apply bus numbers then PCI allocator so firmware can scan the tree and QEMU logs
+     * (acpi/mmio64, virt_pci_bridge, virt_pci) show correct BDFs.
+     */
+    qemu_register_reset(virt_pci_program_bus_numbers_after_reset, vms);
     virt_build_smbios(vms);
     
     warn_report("virt_machine_done: About to hand control to firmware");

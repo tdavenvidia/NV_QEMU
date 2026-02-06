@@ -58,6 +58,8 @@
 #include "hw/mem/nvdimm.h"
 #include "hw/platform-bus.h"
 #include "system/numa.h"
+#include "system/device_tree.h"
+#include "libfdt.h"
 #include "system/reset.h"
 #include "system/tpm.h"
 #include "migration/vmstate.h"
@@ -372,7 +374,6 @@ static void pci_program_pbars(PCIDevice *dev, PhysBAR *pbars, struct GPEXConfig 
                                      pci_config_size(dev),
                                      (uint32_t)(pbar->addr >> 32),
                                      4);
-        
         
         warn_report("acpi/mmio64: programmed %s [%02x:%02x.%x] BAR%d -> 0x%lx",
                     dev->name, pci_dev_bus_num(dev),
@@ -1163,7 +1164,241 @@ static void pci_bus_check_unassigned_mmio64(PCIBus *bus, void *opaque)
     pci_for_each_device_under_bus(bus, pci_dev_check_unassigned_mmio64, opaque);
 }
 
-static void pci_fixed_bar_allocator(struct GPEXConfig *cfg)
+/* Forward declarations */
+static void pci_fixed_bar_allocator(struct GPEXConfig *cfg, VirtMachineState *vms);
+static void virt_update_fdt_pcie_ranges(VirtMachineState *vms);
+static void virt_pci_bridge_program_bus_numbers(PCIBus *root_bus);
+static void virt_pci_print_all_bdfs(PCIBus *root_bus);
+
+/* Find the child bus whose parent bridge is @dev on @bus. Returns NULL if @dev has no child. */
+static PCIBus *virt_pci_find_child_bus(PCIBus *bus, PCIDevice *dev)
+{
+    PCIBus *child_bus;
+
+    if (!dev) {
+        return NULL;
+    }
+    QLIST_FOREACH(child_bus, &bus->child, sibling) {
+        if (child_bus->parent_dev == dev) {
+            return child_bus;
+        }
+    }
+    return NULL;
+}
+
+/* Recursively assign Primary/Secondary/Subordinate bus numbers for all bridges.
+ * Walks in DFS devfn order (slot 0..31, func 0..7), like EDK2, so BDFs match stock firmware. */
+static uint8_t virt_pci_bridge_program_bus_numbers_sub(PCIBus *bus,
+                                                        uint8_t current_bus_num,
+                                                        uint8_t *next_bus_num)
+{
+    uint8_t max_subordinate = current_bus_num;
+    int devfn;
+
+    for (devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *dev = bus->devices[devfn];
+        PCIBus *child_bus;
+        uint8_t secondary, max_child;
+
+        child_bus = virt_pci_find_child_bus(bus, dev);
+        if (!child_bus) {
+            continue;
+        }
+        if (*next_bus_num == 0) {
+            warn_report("virt_pci_bridge_program_bus_numbers: bus number overflow");
+            continue;
+        }
+        secondary = *next_bus_num;
+        (*next_bus_num)++;
+
+        pci_set_byte(dev->config + PCI_PRIMARY_BUS, current_bus_num);
+        pci_set_byte(dev->config + PCI_SECONDARY_BUS, secondary);
+        pci_set_byte(dev->config + PCI_SUBORDINATE_BUS, secondary);  /* temporary */
+
+        max_child = virt_pci_bridge_program_bus_numbers_sub(child_bus, secondary,
+                                                            next_bus_num);
+        pci_set_byte(dev->config + PCI_SUBORDINATE_BUS, max_child);
+        if (max_child > max_subordinate) {
+            max_subordinate = max_child;
+        }
+        /* Log each bridge P/S/S for comparison with stock EDK2 bus numbering */
+        warn_report("virt_pci_bridge: %02x:%02x.%x P=%u S=%u Sub=%u",
+                    (unsigned)current_bus_num,
+                    (unsigned)PCI_SLOT(dev->devfn),
+                    (unsigned)PCI_FUNC(dev->devfn),
+                    (unsigned)current_bus_num,
+                    (unsigned)secondary,
+                    (unsigned)max_child);
+    }
+    return max_subordinate;
+}
+
+/* Program Primary/Secondary/Subordinate bus numbers for the entire PCI tree.
+ * Called after the allocator so firmware (e.g. EDK2) can discover all buses. */
+static void virt_pci_bridge_program_bus_numbers(PCIBus *root_bus)
+{
+    uint8_t next_bus_num = 1;
+    int num_children = 0;
+    PCIBus *child_bus;
+
+    if (!root_bus) {
+        warn_report("virt_pci_bridge_program_bus_numbers: root_bus is NULL");
+        return;
+    }
+    QLIST_FOREACH(child_bus, &root_bus->child, sibling) {
+        num_children++;
+    }
+    warn_report("virt_pci_bridge_program_bus_numbers: root bus has %d child bus(es)",
+                num_children);
+
+    virt_pci_bridge_program_bus_numbers_sub(root_bus, 0, &next_bus_num);
+    warn_report("virt_pci_bridge_program_bus_numbers: programmed bus numbers (1..%u)",
+                (unsigned)(next_bus_num > 1 ? next_bus_num - 1 : 0));
+    virt_pci_print_all_bdfs(root_bus);
+}
+
+/* Re-apply bus number programming after cold reset (reset zeros bridge config). */
+void virt_acpi_pci_program_bus_numbers(PCIBus *root_bus)
+{
+    if (!root_bus) {
+        return;
+    }
+    virt_pci_bridge_program_bus_numbers(root_bus);
+}
+
+/* Re-apply bus numbers then PCI allocator after cold reset so QEMU logs (acpi/mmio64,
+ * virt_pci_bridge, virt_pci) show correct BDFs. Call from the machine reset handler. */
+void virt_acpi_pci_after_reset(VirtMachineState *vms)
+{
+    int ecam_id = VIRT_ECAM_ID(vms->highmem_ecam);
+    bool acpi_pcihp = false;
+    struct GPEXConfig cfg = {
+        .mmio32 = vms->memmap[VIRT_PCIE_MMIO],
+        .pio    = vms->memmap[VIRT_PCIE_PIO],
+        .ecam   = vms->memmap[ecam_id],
+        .irq    = vms->irqmap[VIRT_PCIE] + ARM_SPI_BASE,
+        .bus    = vms->bus,
+        .pci_native_hotplug = true,
+    };
+
+    if (vms->acpi_dev) {
+        acpi_pcihp = object_property_get_bool(OBJECT(vms->acpi_dev),
+                                              ACPI_PM_PROP_ACPI_PCIHP_BRIDGE,
+                                              NULL);
+        cfg.pci_native_hotplug = !acpi_pcihp;
+    }
+    if (vms->pci_preserve_config) {
+        cfg.preserve_config = true;
+    }
+    /* Program bus numbers first so allocator phase logs show correct BDFs */
+    virt_acpi_pci_program_bus_numbers(vms->bus);
+    if (vms->highmem_mmio) {
+        cfg.mmio64 = vms->memmap[VIRT_HIGH_PCIE_MMIO];
+        pci_fixed_bar_allocator(&cfg, vms);
+    }
+}
+
+/* Print each PCI device once with its BDF (bus:slot.func) after bus number programming. */
+static void virt_pci_print_bdfs_on_bus(PCIBus *bus, GHashTable *printed)
+{
+    int bus_num = pci_bus_num(bus);
+    int devfn;
+
+    for (devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *dev = bus->devices[devfn];
+        if (dev && !g_hash_table_contains(printed, dev)) {
+            g_hash_table_add(printed, dev);
+            warn_report("virt_pci: %02x:%02x.%x",
+                        (unsigned)bus_num,
+                        (unsigned)PCI_SLOT(devfn),
+                        (unsigned)PCI_FUNC(devfn));
+        }
+    }
+}
+
+static void virt_pci_print_all_bdfs_sub(PCIBus *bus, GHashTable *printed)
+{
+    int devfn;
+
+    virt_pci_print_bdfs_on_bus(bus, printed);
+    /* Recurse in devfn order (same as bus number programming) */
+    for (devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *dev = bus->devices[devfn];
+        PCIBus *child_bus = virt_pci_find_child_bus(bus, dev);
+
+        if (child_bus) {
+            virt_pci_print_all_bdfs_sub(child_bus, printed);
+        }
+    }
+}
+
+static void virt_pci_print_all_bdfs(PCIBus *root_bus)
+{
+    GHashTable *printed;
+
+    if (!root_bus) {
+        return;
+    }
+    printed = g_hash_table_new(g_direct_hash, g_direct_equal);
+    virt_pci_print_all_bdfs_sub(root_bus, printed);
+    g_hash_table_destroy(printed);
+}
+
+/* Update Device Tree PCI ranges: one MMIO64 entry for the entire high MMIO window (EDK2 expects a single range). */
+static void virt_update_fdt_pcie_ranges(VirtMachineState *vms)
+{
+    MachineState *ms = MACHINE(vms);
+    hwaddr base_mmio = vms->memmap[VIRT_PCIE_MMIO].base;
+    hwaddr size_mmio = vms->memmap[VIRT_PCIE_MMIO].size;
+    hwaddr base_pio = vms->memmap[VIRT_PCIE_PIO].base;
+    hwaddr size_pio = vms->memmap[VIRT_PCIE_PIO].size;
+    hwaddr base_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].base;
+    hwaddr size_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].size;
+    const char *nodename = vms->pciehb_nodename;
+    GArray *ranges;
+
+    if (!nodename) {
+        return;
+    }
+
+    ranges = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+
+    /* 1 IO + 1 MMIO32 + 1 MMIO64 (full window), matching virt.c and EDK2 expectation */
+    uint32_t io_range[] = {
+        cpu_to_be32(FDT_PCI_RANGE_IOPORT), 0, 0,
+        cpu_to_be32(base_pio >> 32), cpu_to_be32(base_pio),
+        cpu_to_be32(size_pio >> 32), cpu_to_be32(size_pio)
+    };
+    g_array_append_vals(ranges, io_range, 7);
+
+    uint32_t mmio32_range[] = {
+        cpu_to_be32(FDT_PCI_RANGE_MMIO),
+        cpu_to_be32(base_mmio >> 32), cpu_to_be32(base_mmio),
+        cpu_to_be32(base_mmio >> 32), cpu_to_be32(base_mmio),
+        cpu_to_be32(size_mmio >> 32), cpu_to_be32(size_mmio)
+    };
+    g_array_append_vals(ranges, mmio32_range, 7);
+
+    uint32_t mmio64_range[] = {
+        cpu_to_be32(FDT_PCI_RANGE_MMIO_64BIT),
+        cpu_to_be32(base_mmio_high >> 32), cpu_to_be32(base_mmio_high),
+        cpu_to_be32(base_mmio_high >> 32), cpu_to_be32(base_mmio_high),
+        cpu_to_be32(size_mmio_high >> 32), cpu_to_be32(size_mmio_high)
+    };
+    g_array_append_vals(ranges, mmio64_range, 7);
+
+    int ret = qemu_fdt_setprop(ms->fdt, nodename, "ranges",
+                               ranges->data, ranges->len * sizeof(uint32_t));
+    if (ret < 0) {
+        warn_report("Failed to update FDT ranges: %s", fdt_strerror(ret));
+    } else {
+        warn_report("Successfully updated FDT ranges with %u entries", (unsigned)(ranges->len / 7));
+    }
+
+    g_array_free(ranges, TRUE);
+}
+
+static void pci_fixed_bar_allocator(struct GPEXConfig *cfg, VirtMachineState *vms)
 {
     VirtPciAllocCfg ncfg1, *ncfg = &ncfg1;
     PCIBus *bus = cfg->bus;
@@ -1195,6 +1430,7 @@ static void pci_fixed_bar_allocator(struct GPEXConfig *cfg)
 
         g_hash_table_destroy(pctx.had_fixed);
     }
+    
     /* Validate: detect any global device-level 64-bit prefetchable span overlaps */
     // TODO
     //
@@ -1226,6 +1462,13 @@ static void pci_fixed_bar_allocator(struct GPEXConfig *cfg)
         pci_for_each_bus(bus, pci_bus_update_prefetch_window, ncfg);
         pci_for_each_bus(bus, pci_bus_check_unassigned_mmio64, ncfg);
     }
+
+    /* All root port bridge windows are programmed; add FDT ranges for each root port */
+    virt_update_fdt_pcie_ranges(vms);
+
+    /* Program bus numbers for entire tree so firmware (e.g. EDK2) can discover all devices */
+    virt_pci_bridge_program_bus_numbers(cfg->bus);
+
     /* Cleanup */
     virt_fixed_claims_reset();
     warn_report("acpi/mmio64: allocator end");
@@ -1290,10 +1533,8 @@ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
         cfg.mmio64 = memmap[VIRT_HIGH_PCIE_MMIO];
 
         /* Run the allocator before firmware (initial build only). */
-        if (any_fixed_bar && update) {
-            pci_fixed_bar_allocator(&cfg);
-	    // tdave: intentional exit , after we have new redesign we remove this exit().
-//	    exit(1);
+        if (any_fixed_bar && !update) {
+            pci_fixed_bar_allocator(&cfg, vms);
         }
     }
 
@@ -2575,9 +2816,7 @@ static void virt_acpi_build_reset(void *build_opaque)
     build_state->patched = false;
 }
 
-
 #if 0
-/* Reset callback to reprogram VFIO device BARs after device reset */
 void virt_reprogram_vfio_bars_on_reset(void *opaque)
 {
     VirtMachineState *vms = opaque;
@@ -2646,7 +2885,7 @@ static const VMStateDescription vmstate_virt_acpi_build = {
         VMSTATE_END_OF_LIST()
     },
 };
-# 
+
 void virt_acpi_setup(VirtMachineState *vms)
 {
     AcpiBuildTables tables;
