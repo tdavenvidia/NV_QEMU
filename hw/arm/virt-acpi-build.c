@@ -889,7 +889,14 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         }
         
         if (remaining_bars->len == 0) {
-            /* No remaining BARs to pack */
+            /* No remaining BARs to pack; still set bridge window from fixed BARs only */
+            if (fixed_bars->len > 0) {
+                g_array_sort(fixed_bars, compare_intervals);
+                uint64_t bus_min_addr = g_array_index(fixed_bars, AddressInterval, 0).start;
+                uint64_t bus_max_addr = g_array_index(fixed_bars, AddressInterval,
+                                                      fixed_bars->len - 1).end;
+                finalize_bridge_window(this_bus, bus_min_addr, bus_max_addr, "phase2");
+            }
             g_array_free(fixed_bars, true);
             g_array_free(remaining_bars, true);
             break;
@@ -1594,9 +1601,6 @@ static void pci_fixed_bar_allocator(struct GPEXConfig *cfg, VirtMachineState *vm
     /* All root port bridge windows are programmed; add FDT ranges for each root port */
     virt_update_fdt_pcie_ranges(vms);
 
-    /* Program bus numbers for entire tree so firmware (e.g. EDK2) can discover all devices */
-    virt_pci_bridge_program_bus_numbers(cfg->bus);
-
     /* Cleanup */
     virt_fixed_claims_reset();
     warn_report("acpi/mmio64: allocator end");
@@ -1657,14 +1661,16 @@ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
         }
     }
 
+    /* tdave: old cocde , now we run after cold reset
     if (vms->highmem_mmio) {
         cfg.mmio64 = memmap[VIRT_HIGH_PCIE_MMIO];
 
-        /* Run the allocator before firmware (initial build only). */
+       // Run the allocator before firmware (initial build only).
         if (any_fixed_bar && !update) {
             pci_fixed_bar_allocator(&cfg, vms);
         }
     }
+    */
 
     acpi_dsdt_add_gpex(scope, &cfg);
     QLIST_FOREACH(bus, &vms->bus->child, sibling) {
