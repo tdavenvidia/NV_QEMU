@@ -1882,19 +1882,30 @@ void virt_machine_done(Notifier *notifier, void *data)
                                        vms->memmap[VIRT_PLATFORM_BUS].size,
                                        vms->irqmap[VIRT_PLATFORM_BUS]);
     }
+    if (vms->pci_pre_enum) {
+        info_report("virt: pci-pre-enum=on: QEMU is doing PCI bus enumeration and resource assignment");
+        /*
+         * Run PCI enumeration and BAR allocator once before loading the DTB so that
+         * virt_update_fdt_pcie_ranges (host + PXB) is applied to ms->fdt. Then the
+         * guest and -machine dumpdtb= see the final PCI ranges. The same enumeration
+         * and allocator are also registered for reset (virt_pci_apply_fix_bar_after_reset)
+         * to re-apply after cold reset, which zeros bridge config.
+         */
+        virt_acpi_pci_after_reset(vms);
+    }
+
     if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
         exit(1);
     }
 
-    /* Do not expose extra root buses via fw_cfg; firmware sees a single root bridge. */
-
+    if (!vms->pci_pre_enum) {
+        pci_bus_add_fw_cfg_extra_pci_roots(vms->fw_cfg, vms->bus,
+                                           &error_abort);
+    }
     virt_acpi_setup(vms);
-    /*
-     * Cold reset runs after machine_done and zeros PCI bridge Primary/Secondary/Subordinate.
-     * Re-apply bus numbers then PCI allocator so firmware can scan the tree and QEMU logs
-     * (acpi/mmio64, virt_pci_bridge, virt_pci) show correct BDFs.
-     */
-    qemu_register_reset(virt_pci_apply_fix_bar_after_reset, vms);
+    if (vms->pci_pre_enum) {
+        qemu_register_reset(virt_pci_apply_fix_bar_after_reset, vms);
+    }
     virt_build_smbios(vms);
     
     warn_report("virt_machine_done: About to hand control to firmware");
@@ -2880,6 +2891,20 @@ static void virt_set_mte(Object *obj, bool value, Error **errp)
     vms->mte = value;
 }
 
+static bool virt_get_pci_pre_enum(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return vms->pci_pre_enum;
+}
+
+static void virt_set_pci_pre_enum(Object *obj, bool value, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    vms->pci_pre_enum = value;
+}
+
 static char *virt_get_gic_version(Object *obj, Error **errp)
 {
     VirtMachineState *vms = VIRT_MACHINE(obj);
@@ -3585,6 +3610,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                           "in ACPI table header."
                                           "The string may be up to 8 bytes in size");
 
+    object_class_property_add_bool(oc, "pci-pre-enum",
+                                   virt_get_pci_pre_enum,
+                                   virt_set_pci_pre_enum);
+    object_class_property_set_description(oc, "pci-pre-enum",
+                                          "Performs the PCI enumeration and resource assigment)");
+
     /* grace-pcie-mmio-identity removed in favor of pcie-mmio-window */
 
 }
@@ -3628,6 +3659,9 @@ static void virt_instance_init(Object *obj)
 
     /* MTE is disabled by default.  */
     vms->mte = false;
+
+    /* PCI pre-enumeration disabled by default */
+    vms->pci_pre_enum = false;
 
     /* Supply kaslr-seed and rng-seed by default */
     vms->dtb_randomness = true;

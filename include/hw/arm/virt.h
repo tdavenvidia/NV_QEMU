@@ -182,6 +182,7 @@ struct VirtMachineState {
     CXLState cxl_devices_state;
     bool legacy_smmuv3_present;
     bool pci_preserve_config;
+    bool pci_pre_enum;
     /* Override for high PCIe MMIO window (BASE:SIZE) */
     bool pcie_mmio_window_override;
     hwaddr override_pcie_mmio_base;
