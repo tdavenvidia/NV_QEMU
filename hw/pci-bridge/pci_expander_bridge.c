@@ -390,12 +390,6 @@ static bool pxb_dev_realize_common(PCIDevice *dev, enum BusType type,
     pci_word_test_and_set_mask(dev->config + PCI_STATUS,
                                PCI_STATUS_66MHZ | PCI_STATUS_FAST_BACK);
     pci_config_set_class(dev->config, PCI_CLASS_BRIDGE_HOST);
-    /*
-     * Present Type 1 (bridge) config header so firmware (e.g. EDK2 with
-     * PcdPciDisableBusEnumeration=TRUE) can scan the pre-configured tree:
-     * it reads Primary/Secondary/Subordinate at 0x18-0x1a and recurses.
-     */
-    dev->config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_BRIDGE;
 
     pxb_dev_list = g_list_insert_sorted(pxb_dev_list, pxb, pxb_compare);
     return true;
