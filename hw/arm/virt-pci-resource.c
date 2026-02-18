@@ -1226,59 +1226,6 @@ static void pci_bus_check_unassigned_mmio64(PCIBus *bus, void *opaque)
     pci_for_each_device_under_bus(bus, pci_dev_check_unassigned_mmio64, opaque);
 }
 
-/* Update Device Tree PCI ranges: one MMIO64 entry for the entire high MMIO window (EDK2 expects a single range). */
-static void virt_update_fdt_pcie_ranges(VirtMachineState *vms)
-{
-    MachineState *ms = MACHINE(vms);
-    hwaddr base_mmio = vms->memmap[VIRT_PCIE_MMIO].base;
-    hwaddr size_mmio = vms->memmap[VIRT_PCIE_MMIO].size;
-    hwaddr base_pio = vms->memmap[VIRT_PCIE_PIO].base;
-    hwaddr size_pio = vms->memmap[VIRT_PCIE_PIO].size;
-    hwaddr base_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].base;
-    hwaddr size_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].size;
-    const char *nodename = vms->pciehb_nodename;
-    GArray *ranges;
-
-    if (!nodename) {
-        return;
-    }
-
-    ranges = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-
-    /* 1 IO + 1 MMIO32 + 1 MMIO64 (full window), matching virt.c and EDK2 expectation */
-    uint32_t io_range[] = {
-        cpu_to_be32(FDT_PCI_RANGE_IOPORT), 0, 0,
-        cpu_to_be32(base_pio >> 32), cpu_to_be32(base_pio),
-        cpu_to_be32(size_pio >> 32), cpu_to_be32(size_pio)
-    };
-    g_array_append_vals(ranges, io_range, 7);
-
-    uint32_t mmio32_range[] = {
-        cpu_to_be32(FDT_PCI_RANGE_MMIO),
-        cpu_to_be32(base_mmio >> 32), cpu_to_be32(base_mmio),
-        cpu_to_be32(base_mmio >> 32), cpu_to_be32(base_mmio),
-        cpu_to_be32(size_mmio >> 32), cpu_to_be32(size_mmio)
-    };
-    g_array_append_vals(ranges, mmio32_range, 7);
-
-    uint32_t mmio64_range[] = {
-        cpu_to_be32(FDT_PCI_RANGE_MMIO_64BIT),
-        cpu_to_be32(base_mmio_high >> 32), cpu_to_be32(base_mmio_high),
-        cpu_to_be32(base_mmio_high >> 32), cpu_to_be32(base_mmio_high),
-        cpu_to_be32(size_mmio_high >> 32), cpu_to_be32(size_mmio_high)
-    };
-    g_array_append_vals(ranges, mmio64_range, 7);
-
-    int ret = qemu_fdt_setprop(ms->fdt, nodename, "ranges",
-                               ranges->data, ranges->len * sizeof(uint32_t));
-    if (ret < 0) {
-        warn_report("Failed to update FDT ranges: %s", fdt_strerror(ret));
-    } else {
-        warn_report("Successfully updated FDT ranges with %u entries", (unsigned)(ranges->len / 7));
-    }
-
-    g_array_free(ranges, TRUE);
-}
 
 void pci_fixed_bar_allocator(VirtMachineState *vms)
 {
@@ -1343,7 +1290,7 @@ void pci_fixed_bar_allocator(VirtMachineState *vms)
     }
 
     /* All root port bridge windows are programmed; add FDT ranges for each root port */
-    virt_update_fdt_pcie_ranges(vms);
+    //virt_update_fdt_pcie_ranges(vms);
 
     /* Cleanup */
     virt_fixed_claims_reset();
