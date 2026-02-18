@@ -1882,17 +1882,6 @@ void virt_machine_done(Notifier *notifier, void *data)
                                        vms->memmap[VIRT_PLATFORM_BUS].size,
                                        vms->irqmap[VIRT_PLATFORM_BUS]);
     }
-    if (vms->pci_pre_enum) {
-        info_report("virt: pci-pre-enum=on: QEMU is doing PCI bus enumeration and resource assignment");
-        /*
-         * Run PCI enumeration and BAR allocator once before loading the DTB so that
-         * virt_update_fdt_pcie_ranges (host + PXB) is applied to ms->fdt. Then the
-         * guest and -machine dumpdtb= see the final PCI ranges. The same enumeration
-         * and allocator are also registered for reset (virt_pci_apply_fix_bar_after_reset)
-         * to re-apply after cold reset, which zeros bridge config.
-         */
-        virt_acpi_pci_after_reset(vms);
-    }
 
     if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
         exit(1);
