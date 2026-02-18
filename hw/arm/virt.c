@@ -37,6 +37,7 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/primecell.h"
 #include "hw/arm/virt.h"
+#include "hw/arm/virt-pci-resource.h"
 #include "hw/block/flash.h"
 #include "hw/vfio/vfio-calxeda-xgmac.h"
 #include "hw/vfio/vfio-amd-xgbe.h"
@@ -1850,7 +1851,10 @@ static void virt_build_smbios(VirtMachineState *vms)
 
 static void virt_pci_apply_fix_bar_after_reset(void *opaque)
 {
-    virt_acpi_pci_after_reset((VirtMachineState *)opaque);
+    VirtMachineState *vms = (VirtMachineState *)opaque;
+
+    virt_pci_enumerate_bus(vms->bus);
+    pci_fixed_bar_allocator(vms);
 }
 
 static
