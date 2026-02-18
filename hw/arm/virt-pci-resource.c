@@ -558,6 +558,519 @@ typedef struct {
     GHashTable *had_fixed; /* set of PCIDevice* that had at least one fixed BAR */
 } VirtPciProgramCtx;
 
+/* Phase 2: run once per bus that has at least one device in had_fixed.
+ * Packs all remaining 64-bit prefetchable BARs on that bus and finalizes
+ * the bridge window.
+ */
+static void pci_bus_phase2_pack_remaining_bars(PCIBus *bus, void *opaque)
+{
+    VirtPciProgramCtx *pctx = (VirtPciProgramCtx *)opaque;
+    struct GPEXConfig *cfg = pctx->cfg;
+    PCIBus *this_bus = bus;
+    uint64_t mmio_start = cfg->mmio64.base;
+    uint64_t mmio_end = cfg->mmio64.base + cfg->mmio64.size - 1;
+
+    GArray *fixed_bars = g_array_new(false, false, sizeof(AddressInterval));
+    GArray *remaining_bars = g_array_new(false, false, sizeof(BarEntry));
+    bool bus_has_fixed = false;
+
+    /* Single pass: collect fixed BARs and remaining BARs for all devices on this bus */
+    for (int devfn = 0; devfn < ARRAY_SIZE(this_bus->devices); devfn++) {
+        PCIDevice *d = this_bus->devices[devfn];
+        if (!d) {
+            continue;
+        }
+
+        bool device_has_fixed = g_hash_table_contains(pctx->had_fixed, d);
+        if (device_has_fixed) {
+            bus_has_fixed = true;
+        }
+
+        for (int i = 0; i < PCI_ROM_SLOT; i++) {
+            PCIIORegion *r = &d->io_regions[i];
+            if (!is_64bit_pref_bar(r)) {
+                continue;
+            }
+
+            if (device_has_fixed &&
+                d->fixed_bar_pci_boot_config &&
+                d->fixed_bar_pci_boot_config_addr[i] != PCI_BAR_UNMAPPED) {
+                AddressInterval interval = {
+                    .start = d->fixed_bar_pci_boot_config_addr[i],
+                    .end = d->fixed_bar_pci_boot_config_addr[i] + r->size - 1
+                };
+                g_array_append_val(fixed_bars, interval);
+            } else {
+                BarEntry entry = { .dev = d, .bar_idx = i, .size = r->size };
+                g_array_append_val(remaining_bars, entry);
+            }
+        }
+    }
+
+    if (!bus_has_fixed) {
+        g_array_free(fixed_bars, true);
+        g_array_free(remaining_bars, true);
+        return;
+    }
+
+    warn_report("acpi/mmio64: phase2 (pack bus) bus [%02x]",
+                pci_bus_num(this_bus));
+
+    if (remaining_bars->len == 0) {
+        if (fixed_bars->len > 0) {
+            g_array_sort(fixed_bars, compare_intervals);
+            uint64_t bus_min_addr = g_array_index(fixed_bars, AddressInterval, 0).start;
+            uint64_t bus_max_addr = g_array_index(fixed_bars, AddressInterval,
+                                                  fixed_bars->len - 1).end;
+            finalize_bridge_window(this_bus, bus_min_addr, bus_max_addr, "phase2");
+        }
+        g_array_free(fixed_bars, true);
+        g_array_free(remaining_bars, true);
+        return;
+    }
+
+    g_array_sort(fixed_bars, compare_intervals);
+    g_array_sort(remaining_bars, compare_bar_size_desc);
+
+    uint64_t remaining_demand = 0;
+    for (guint i = 0; i < remaining_bars->len; i++) {
+        BarEntry *e = &g_array_index(remaining_bars, BarEntry, i);
+        remaining_demand += e->size;
+    }
+
+    warn_report("acpi/mmio64: phase2 bus [%02x] remaining_bars=%u remaining_demand=0x%"PRIx64,
+                pci_bus_num(this_bus), remaining_bars->len, remaining_demand);
+
+    uint64_t leftmost_anchor = g_array_index(fixed_bars, AddressInterval, 0).start;
+    uint64_t rightmost_anchor_end = g_array_index(fixed_bars, AddressInterval,
+                                                    fixed_bars->len - 1).end;
+
+    uint64_t valid_start = mmio_start;
+    uint64_t valid_end = mmio_end;
+
+    if (virt_fixed_claims) {
+        for (guint i = 0; i < virt_fixed_claims->len; i++) {
+            FixedClaim *claim = &g_array_index(virt_fixed_claims, FixedClaim, i);
+
+            if (claim->end < leftmost_anchor && claim->end >= valid_start) {
+                valid_start = claim->end + 1;
+            }
+
+            if (claim->start > rightmost_anchor_end && claim->start <= valid_end) {
+                valid_end = claim->start - 1;
+            }
+        }
+    }
+
+    warn_report("acpi/mmio64: phase2 bus [%02x] valid_range=[0x%"PRIx64"..0x%"PRIx64"] "
+                "anchors=[0x%"PRIx64"..0x%"PRIx64"]",
+                pci_bus_num(this_bus), valid_start, valid_end,
+                leftmost_anchor, rightmost_anchor_end);
+
+    GArray *holes = compute_real_holes(fixed_bars, valid_start, valid_end);
+
+    warn_report("acpi/mmio64: phase2 bus [%02x] found %u fixed BARs, %u real holes",
+                pci_bus_num(this_bus), fixed_bars->len, holes->len);
+
+    CategorizedHoles cat = categorize_holes(holes, fixed_bars);
+
+    int selected_hole = -1;
+    uint64_t pack_start = 0, pack_end = 0;
+    const char *hole_type = NULL;
+
+    if (cat.middle_holes->len > 0) {
+        int largest_middle = -1;
+        uint64_t largest_size = 0;
+
+        for (guint i = 0; i < cat.middle_holes->len; i++) {
+            int h = g_array_index(cat.middle_holes, int, i);
+            AddressInterval *hole = &g_array_index(holes, AddressInterval, h);
+            uint64_t hole_size = hole->end - hole->start + 1;
+
+            if (hole_size >= remaining_demand && hole_size > largest_size) {
+                largest_size = hole_size;
+                largest_middle = h;
+            }
+        }
+
+        if (largest_middle >= 0) {
+            selected_hole = largest_middle;
+            hole_type = "MIDDLE";
+            warn_report("acpi/mmio64: phase2 bus [%02x] selected largest MIDDLE hole %d (size=0x%"PRIx64")",
+                        pci_bus_num(this_bus), selected_hole, largest_size);
+        }
+    }
+
+    if (selected_hole < 0 && cat.rightmost_hole >= 0) {
+        AddressInterval *hole = &g_array_index(holes, AddressInterval, cat.rightmost_hole);
+        uint64_t hole_size = hole->end - hole->start + 1;
+
+        if (hole_size >= remaining_demand) {
+            selected_hole = cat.rightmost_hole;
+            hole_type = "RIGHT";
+            warn_report("acpi/mmio64: phase2 bus [%02x] selected RIGHTMOST hole %d (size=0x%"PRIx64")",
+                        pci_bus_num(this_bus), selected_hole, hole_size);
+        }
+    }
+
+    if (selected_hole < 0 && cat.leftmost_hole >= 0) {
+        AddressInterval *hole = &g_array_index(holes, AddressInterval, cat.leftmost_hole);
+        uint64_t hole_size = hole->end - hole->start + 1;
+
+        if (hole_size >= remaining_demand) {
+            selected_hole = cat.leftmost_hole;
+            hole_type = "LEFT";
+            warn_report("acpi/mmio64: phase2 bus [%02x] selected LEFTMOST hole %d (size=0x%"PRIx64")",
+                        pci_bus_num(this_bus), selected_hole, hole_size);
+        }
+    }
+
+    g_array_free(cat.middle_holes, true);
+
+    if (selected_hole < 0) {
+        error_report("acpi/mmio64: phase2 bus [%02x] insufficient contiguous space for "
+                     "remaining_demand=0x%"PRIx64,
+                     pci_bus_num(this_bus), remaining_demand);
+        g_array_free(holes, true);
+        g_array_free(fixed_bars, true);
+        g_array_free(remaining_bars, true);
+        exit(1);
+    }
+
+    AddressInterval *selected = &g_array_index(holes, AddressInterval, selected_hole);
+    pack_start = selected->start;
+    pack_end = selected->end;
+
+    warn_report("acpi/mmio64: phase2 bus [%02x] packing %s in hole %d: [0x%"PRIx64"..0x%"PRIx64"]",
+                pci_bus_num(this_bus), hole_type, selected_hole, pack_start, pack_end);
+
+    g_array_free(holes, true);
+
+    uint64_t bus_min_addr, bus_max_addr;
+    if (!pack_bars_into_region(remaining_bars, pack_start, pack_end, cfg,
+                               &bus_min_addr, &bus_max_addr)) {
+        error_report("acpi/mmio64: phase2 bus [%02x] failed to pack BARs",
+                     pci_bus_num(this_bus));
+        g_array_free(fixed_bars, true);
+        g_array_free(remaining_bars, true);
+        exit(1);
+    }
+
+    for (guint i = 0; i < fixed_bars->len; i++) {
+        AddressInterval *fixed = &g_array_index(fixed_bars, AddressInterval, i);
+        bus_min_addr = MIN(bus_min_addr, fixed->start);
+        bus_max_addr = MAX(bus_max_addr, fixed->end);
+    }
+
+    finalize_bridge_window(this_bus, bus_min_addr, bus_max_addr, "phase2");
+
+    g_array_free(fixed_bars, true);
+    g_array_free(remaining_bars, true);
+}
+
+/* Phase 3 helpers: buses with no fixed-BAR devices. */
+
+/* True if this 64-bit pref BAR is already assigned (fixed or in config). */
+static bool phase3_bar_is_assigned(PCIDevice *dev, int bar_idx, GHashTable *had_fixed)
+{
+    PCIIORegion *r = &dev->io_regions[bar_idx];
+    if (!is_64bit_pref_bar(r)) {
+        return false;
+    }
+    if (dev->fixed_bar_pci_boot_config &&
+        dev->fixed_bar_pci_boot_config_addr[bar_idx] != PCI_BAR_UNMAPPED) {
+        return true;
+    }
+    /* Programmed in config? */
+    if (bar_idx >= PCI_ROM_SLOT - 1) {
+        return false; /* 64-bit BAR uses two slots */
+    }
+    {
+        uint32_t lo = pci_get_long(dev->config + PCI_BASE_ADDRESS_0 + bar_idx * 4);
+        if (!(lo & PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+            return (lo & PCI_BASE_ADDRESS_MEM_MASK) != 0;
+        }
+        uint32_t hi = pci_get_long(dev->config + PCI_BASE_ADDRESS_0 + bar_idx * 4 + 4);
+        return (((uint64_t)hi << 32) | (lo & PCI_BASE_ADDRESS_MEM_MASK)) != 0;
+    }
+}
+
+/* BAR address from config, or 0 if unassigned. */
+static uint64_t phase3_get_bar_addr_from_config(PCIDevice *dev, int bar_idx)
+{
+    PCIIORegion *r = &dev->io_regions[bar_idx];
+    if (!r->size || bar_idx >= PCI_ROM_SLOT - 1) {
+        return 0;
+    }
+    uint32_t lo = pci_get_long(dev->config + PCI_BASE_ADDRESS_0 + bar_idx * 4);
+    if (lo & PCI_BASE_ADDRESS_MEM_TYPE_64) {
+        uint32_t hi = pci_get_long(dev->config + PCI_BASE_ADDRESS_0 + bar_idx * 4 + 4);
+        return ((uint64_t)hi << 32) | (lo & PCI_BASE_ADDRESS_MEM_MASK);
+    }
+    return lo & PCI_BASE_ADDRESS_MEM_MASK;
+}
+
+/* Total size of unassigned 64-bit pref BARs in this bus and its subtree. */
+static uint64_t size_entire_subtree(PCIBus *bus, GHashTable *had_fixed)
+{
+    uint64_t total = 0;
+    for (int devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *d = bus->devices[devfn];
+        if (!d) {
+            continue;
+        }
+        for (int i = 0; i < PCI_ROM_SLOT; i++) {
+            PCIIORegion *r = &d->io_regions[i];
+            if (!is_64bit_pref_bar(r)) {
+                continue;
+            }
+            if (phase3_bar_is_assigned(d, i, had_fixed)) {
+                continue;
+            }
+            total += ROUND_UP(r->size, r->size);
+        }
+        if (IS_PCI_BRIDGE(d)) {
+            total += size_entire_subtree(pci_bridge_get_sec_bus(PCI_BRIDGE(d)), had_fixed);
+        }
+    }
+    return total;
+}
+
+/* Highest end address of any assigned BAR or bridge window in this bus and subtree. */
+static uint64_t find_highest_assigned_in_bus(PCIBus *bus)
+{
+    uint64_t highest = 0;
+    for (int devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *d = bus->devices[devfn];
+        if (!d) {
+            continue;
+        }
+        if (IS_PCI_BRIDGE(d)) {
+            PCIBus *sec = pci_bridge_get_sec_bus(PCI_BRIDGE(d));
+            PCIDevice *bridge_dev = pci_bridge_get_device(sec);
+            if (bridge_dev) {
+                uint64_t base = pci_bridge_get_base(bridge_dev, PCI_BASE_ADDRESS_MEM_PREFETCH);
+                uint64_t limit = pci_bridge_get_limit(bridge_dev, PCI_BASE_ADDRESS_MEM_PREFETCH);
+                if (limit > base) {
+                    highest = MAX(highest, limit);
+                }
+                highest = MAX(highest, find_highest_assigned_in_bus(sec));
+            }
+            continue;
+        }
+        for (int i = 0; i < PCI_ROM_SLOT; i++) {
+            PCIIORegion *r = &d->io_regions[i];
+            if (!is_64bit_pref_bar(r)) {
+                continue;
+            }
+            uint64_t addr = 0;
+            if (d->fixed_bar_pci_boot_config &&
+                d->fixed_bar_pci_boot_config_addr[i] != PCI_BAR_UNMAPPED) {
+                addr = d->fixed_bar_pci_boot_config_addr[i];
+            } else {
+                addr = phase3_get_bar_addr_from_config(d, i);
+            }
+            if (addr != 0 && r->size) {
+                highest = MAX(highest, addr + r->size - 1);
+            }
+        }
+    }
+    return highest;
+}
+
+/* Next free address in root MMIO64. */
+static uint64_t phase3_next_free_from_root(struct GPEXConfig *cfg)
+{
+    uint64_t mmio_start = cfg->mmio64.base;
+    uint64_t mmio_end = cfg->mmio64.base + cfg->mmio64.size - 1;
+    uint64_t highest = mmio_start - 1;
+    if (virt_fixed_claims) {
+        for (guint i = 0; i < virt_fixed_claims->len; i++) {
+            FixedClaim *c = &g_array_index(virt_fixed_claims, FixedClaim, i);
+            if (c->end >= mmio_start && c->start <= mmio_end) {
+                highest = MAX(highest, c->end);
+            }
+        }
+    }
+    return ROUND_UP(highest + 1, 0x1000); /* 4K align for new window */
+}
+
+/* Phase 3: allocate and program 64-bit pref BARs for a bus with no fixed-BAR devices. */
+static void allocate_bus_phase3(PCIBus *bus, VirtPciProgramCtx *pctx)
+{
+    struct GPEXConfig *cfg = pctx->cfg;
+    PCIDevice *parent_bridge = pci_bridge_get_device(bus);
+    uint64_t mmio_end = cfg->mmio64.base + cfg->mmio64.size - 1;
+
+    if (!parent_bridge) {
+        return; /* Root bus has no bridge; skip */
+    }
+
+    uint64_t window_base = pci_bridge_get_base(parent_bridge, PCI_BASE_ADDRESS_MEM_PREFETCH);
+    uint64_t window_limit = pci_bridge_get_limit(parent_bridge, PCI_BASE_ADDRESS_MEM_PREFETCH);
+    bool window_not_programmed = (window_base >= window_limit) ||
+                                 (window_base < cfg->mmio64.base) ||
+                                 (window_limit > mmio_end);
+
+    /* Step 1: ensure parent bridge window exists */
+    if (window_not_programmed) {
+        uint64_t required = size_entire_subtree(bus, pctx->had_fixed);
+        if (required == 0) {
+            return;
+        }
+        required = ROUND_UP(required, 0x1000);
+
+        PCIBus *parent_bus = pci_get_bus(parent_bridge);
+        PCIDevice *grandparent = parent_bus ? pci_bridge_get_device(parent_bus) : NULL;
+
+        if (!grandparent) {
+            window_base = phase3_next_free_from_root(cfg);
+            window_limit = window_base + required - 1;
+            if (window_limit > mmio_end) {
+                error_report("acpi/mmio64: phase3 bus [%02x] out of root MMIO64 space",
+                             pci_bus_num(bus));
+                exit(1);
+            }
+        } else {
+            uint64_t parent_win_base = pci_bridge_get_base(grandparent, PCI_BASE_ADDRESS_MEM_PREFETCH);
+            uint64_t parent_win_limit = pci_bridge_get_limit(grandparent, PCI_BASE_ADDRESS_MEM_PREFETCH);
+            bool parent_in_mmio64 = (parent_win_limit > parent_win_base) &&
+                                   (parent_win_base >= cfg->mmio64.base) &&
+                                   (parent_win_limit <= mmio_end);
+            if (!parent_in_mmio64) {
+                window_base = phase3_next_free_from_root(cfg);
+                window_limit = window_base + required - 1;
+                if (window_limit > mmio_end) {
+                    error_report("acpi/mmio64: phase3 bus [%02x] out of root MMIO64 space",
+                                 pci_bus_num(bus));
+                    exit(1);
+                }
+            } else {
+                uint64_t next_in_subtree = ROUND_UP(find_highest_assigned_in_bus(parent_bus) + 1, 0x1000);
+                window_base = MAX(parent_win_base, next_in_subtree);
+                window_limit = window_base + required - 1;
+                if (window_limit > parent_win_limit) {
+                    error_report("acpi/mmio64: phase3 bus [%02x] no room in parent bridge window",
+                                 pci_bus_num(bus));
+                    exit(1);
+                }
+            }
+        }
+        finalize_bridge_window(bus, window_base, window_limit, "phase3");
+    }
+
+    window_base = pci_bridge_get_base(parent_bridge, PCI_BASE_ADDRESS_MEM_PREFETCH);
+    window_limit = pci_bridge_get_limit(parent_bridge, PCI_BASE_ADDRESS_MEM_PREFETCH);
+
+    /* Step 2: current free address in window */
+    uint64_t current = ROUND_UP(find_highest_assigned_in_bus(bus) + 1, 0x1000);
+    if (current < window_base) {
+        current = window_base;
+    }
+
+    /* Step 3: collect unassigned 64-bit pref BARs on this bus */
+    uint64_t required = 0;
+    GArray *bars_this_bus = g_array_new(false, false, sizeof(BarEntry));
+    for (int devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *d = bus->devices[devfn];
+        if (!d) {
+            continue;
+        }
+        for (int i = 0; i < PCI_ROM_SLOT; i++) {
+            PCIIORegion *r = &d->io_regions[i];
+            if (!is_64bit_pref_bar(r)) {
+                continue;
+            }
+            if (phase3_bar_is_assigned(d, i, pctx->had_fixed)) {
+                continue;
+            }
+            required += ROUND_UP(r->size, r->size);
+            g_array_append_val(bars_this_bus, ((BarEntry){ .dev = d, .bar_idx = i, .size = r->size }));
+        }
+    }
+
+    if (bars_this_bus->len == 0) {
+        g_array_free(bars_this_bus, true);
+        return;
+    }
+
+    /* Step 4: extend window if needed */
+    if (current + required > window_limit) {
+        PCIBus *parent_bus = pci_get_bus(parent_bridge);
+        PCIDevice *grandparent = parent_bus ? pci_bridge_get_device(parent_bus) : NULL;
+        uint64_t parent_limit = mmio_end;
+        if (grandparent) {
+            uint64_t gp_base = pci_bridge_get_base(grandparent, PCI_BASE_ADDRESS_MEM_PREFETCH);
+            uint64_t gp_limit = pci_bridge_get_limit(grandparent, PCI_BASE_ADDRESS_MEM_PREFETCH);
+            if (gp_limit > gp_base && gp_base >= cfg->mmio64.base) {
+                parent_limit = gp_limit;
+            }
+        }
+        uint64_t new_limit = current + required - 1;
+        if (new_limit > parent_limit) {
+            error_report("acpi/mmio64: phase3 bus [%02x] out of MMIO space (required 0x%"PRIx64")",
+                         pci_bus_num(bus), required);
+            g_array_free(bars_this_bus, true);
+            exit(1);
+        }
+        if (new_limit > window_limit) {
+            pci_update_prefetch_window(bus, window_base, new_limit);
+            virt_fixed_claims_add(window_limit + 1, new_limit, parent_bridge, -1);
+            window_limit = new_limit;
+        }
+    }
+
+    /* Step 5: assign BARs */
+    g_array_sort(bars_this_bus, compare_bar_size_desc);
+    uint64_t addr = current;
+    for (guint i = 0; i < bars_this_bus->len; i++) {
+        BarEntry *e = &g_array_index(bars_this_bus, BarEntry, i);
+        PCIIORegion *r = &e->dev->io_regions[e->bar_idx];
+        addr = ROUND_UP(addr, r->size);
+        uint64_t bar_end = addr + r->size - 1;
+
+        PhysBAR pbars_array[PCI_ROM_SLOT];
+        memset(pbars_array, 0, sizeof(pbars_array));
+        pbars_array[e->bar_idx].addr = addr;
+        pbars_array[e->bar_idx].end = bar_end;
+        pbars_array[e->bar_idx].flags = IORESOURCE_PREFETCH;
+        pci_program_pbars(e->dev, pbars_array, cfg);
+
+        warn_report("acpi/mmio64: phase3 bus [%02x] assigned %s [%02x:%02x.%x] BAR%d -> 0x%"PRIx64,
+                    pci_bus_num(bus), e->dev->name, pci_dev_bus_num(e->dev),
+                    PCI_SLOT(e->dev->devfn), PCI_FUNC(e->dev->devfn), e->bar_idx, addr);
+        addr = bar_end + 1;
+    }
+
+    {
+        uint64_t high = find_highest_assigned_in_bus(bus);
+        if (high > window_limit) {
+            pci_update_prefetch_window(bus, window_base, high);
+            virt_fixed_claims_add(window_limit + 1, high, parent_bridge, -1);
+        }
+    }
+    g_array_free(bars_this_bus, true);
+}
+
+/* Phase 3: run once per bus; act only when the bus has no fixed-BAR devices. */
+static void pci_bus_phase3_allocate_no_fixed_bars(PCIBus *bus, void *opaque)
+{
+    VirtPciProgramCtx *pctx = (VirtPciProgramCtx *)opaque;
+    bool bus_has_fixed = false;
+    for (int devfn = 0; devfn < ARRAY_SIZE(bus->devices); devfn++) {
+        PCIDevice *d = bus->devices[devfn];
+        if (d && g_hash_table_contains(pctx->had_fixed, d)) {
+            bus_has_fixed = true;
+            break;
+        }
+    }
+    if (bus_has_fixed) {
+        return;
+    }
+    warn_report("acpi/mmio64: phase3 (no fixed BARs) bus [%02x]", pci_bus_num(bus));
+    allocate_bus_phase3(bus, pctx);
+}
+
 static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque)
 {
     VirtPciProgramCtx *pctx = (VirtPciProgramCtx *)opaque;
@@ -619,225 +1132,9 @@ static void pci_dev_program_bars_phase(PCIBus *bus, PCIDevice *dev, void *opaque
         pci_program_pbars(dev, pbars, cfg);
         break;
     }
-    case PCI_PHASE_PACK_BARS_FOR_FIXED_BAR_DEVICES: {
-        if (!g_hash_table_contains(pctx->had_fixed, dev)) {
-            return;
-        }
-        warn_report("acpi/mmio64: phase2 (pack-fixed-dev) dev [%02x:%02x.%x] %s",
-                    pci_dev_bus_num(dev), PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
-                    dev->name);
-        
-        PCIBus *this_bus = pci_get_bus(dev);
-        uint64_t mmio_start = cfg->mmio64.base;
-        uint64_t mmio_end = cfg->mmio64.base + cfg->mmio64.size - 1;
-        
-        /* Single pass: collect both fixed and remaining BARs */
-        GArray *fixed_bars = g_array_new(false, false, sizeof(AddressInterval));
-        GArray *remaining_bars = g_array_new(false, false, sizeof(BarEntry));
-
-        for (int devfn = 0; devfn < ARRAY_SIZE(this_bus->devices); devfn++) {
-            PCIDevice *d = this_bus->devices[devfn];
-            if (!d) {
-                continue;
-            }
-
-            /* Collect fixed BARs only from devices that have pci-boot-config */
-            bool device_has_fixed = g_hash_table_contains(pctx->had_fixed, d);
-
-            for (int i = 0; i < PCI_ROM_SLOT; i++) {
-                PCIIORegion *r = &d->io_regions[i];
-                if (!is_64bit_pref_bar(r)) {
-                    continue;
-                }
-
-                if (device_has_fixed &&
-                    d->fixed_bar_pci_boot_config &&
-                    d->fixed_bar_pci_boot_config_addr[i] != PCI_BAR_UNMAPPED) {
-                    /* Fixed BAR: collect for hole computation */
-                    AddressInterval interval = {
-                        .start = d->fixed_bar_pci_boot_config_addr[i],
-                        .end = d->fixed_bar_pci_boot_config_addr[i] + r->size - 1
-                    };
-                    g_array_append_val(fixed_bars, interval);
-                } else {
-                    /* Remaining BAR: collect for packing (from ALL devices on this bus) */
-                    BarEntry entry = { .dev = d, .bar_idx = i, .size = r->size };
-                    g_array_append_val(remaining_bars, entry);
-                }
-            }
-        }
-        
-        if (remaining_bars->len == 0) {
-            /* No remaining BARs to pack; still set bridge window from fixed BARs only */
-            if (fixed_bars->len > 0) {
-                g_array_sort(fixed_bars, compare_intervals);
-                uint64_t bus_min_addr = g_array_index(fixed_bars, AddressInterval, 0).start;
-                uint64_t bus_max_addr = g_array_index(fixed_bars, AddressInterval,
-                                                      fixed_bars->len - 1).end;
-                finalize_bridge_window(this_bus, bus_min_addr, bus_max_addr, "phase2");
-            }
-            g_array_free(fixed_bars, true);
-            g_array_free(remaining_bars, true);
-            break;
-        }
-        
-        /* Sort fixed BARs by address (for hole computation) */
-        g_array_sort(fixed_bars, compare_intervals);
-        
-        /* Sort remaining BARs by size descending (for packing) */
-        g_array_sort(remaining_bars, compare_bar_size_desc);
-        
-        /* Calculate remaining demand */
-        uint64_t remaining_demand = 0;
-        for (guint i = 0; i < remaining_bars->len; i++) {
-            BarEntry *e = &g_array_index(remaining_bars, BarEntry, i);
-            remaining_demand += e->size;
-        }
-        
-        warn_report("acpi/mmio64: phase2 bus [%02x] remaining_bars=%u remaining_demand=0x%"PRIx64,
-                    pci_bus_num(this_bus), remaining_bars->len, remaining_demand);
-        
-        /* Compute valid range for THIS bus by finding nearest claims */
-        uint64_t leftmost_anchor = g_array_index(fixed_bars, AddressInterval, 0).start;
-        uint64_t rightmost_anchor_end = g_array_index(fixed_bars, AddressInterval, 
-                                                        fixed_bars->len - 1).end;
-        
-        uint64_t valid_start = mmio_start;
-        uint64_t valid_end = mmio_end;
-        
-        /* Scan global claims to find boundaries */
-        if (virt_fixed_claims) {
-            for (guint i = 0; i < virt_fixed_claims->len; i++) {
-                FixedClaim *claim = &g_array_index(virt_fixed_claims, FixedClaim, i);
-                
-                /* Find highest claim ending before our leftmost anchor */
-                if (claim->end < leftmost_anchor && claim->end >= valid_start) {
-                    valid_start = claim->end + 1;
-                }
-                
-                /* Find lowest claim starting after our rightmost anchor */
-                if (claim->start > rightmost_anchor_end && claim->start <= valid_end) {
-                    valid_end = claim->start - 1;
-                }
-            }
-        }
-        
-        warn_report("acpi/mmio64: phase2 bus [%02x] valid_range=[0x%"PRIx64"..0x%"PRIx64"] "
-                    "anchors=[0x%"PRIx64"..0x%"PRIx64"]",
-                    pci_bus_num(this_bus), valid_start, valid_end, 
-                    leftmost_anchor, rightmost_anchor_end);
-        
-        /* Compute REAL holes within THIS bus's valid range */
-        GArray *holes = compute_real_holes(fixed_bars, valid_start, valid_end);
-        
-        warn_report("acpi/mmio64: phase2 bus [%02x] found %u fixed BARs, %u real holes",
-                    pci_bus_num(this_bus), fixed_bars->len, holes->len);
-        
-        /* Categorize holes: leftmost (before first anchor), middle, rightmost (after last anchor) */
-        CategorizedHoles cat = categorize_holes(holes, fixed_bars);
-        
-        /* Strategy: Try largest middle hole first, then rightmost, then leftmost */
-        int selected_hole = -1;
-        uint64_t pack_start = 0, pack_end = 0;
-        const char *hole_type = NULL;
-        
-        /* 1. Try largest middle hole first (optimal for bridge window) */
-        if (cat.middle_holes->len > 0) {
-            int largest_middle = -1;
-            uint64_t largest_size = 0;
-            
-            for (guint i = 0; i < cat.middle_holes->len; i++) {
-                int h = g_array_index(cat.middle_holes, int, i);
-                AddressInterval *hole = &g_array_index(holes, AddressInterval, h);
-                uint64_t hole_size = hole->end - hole->start + 1;
-                
-                if (hole_size >= remaining_demand && hole_size > largest_size) {
-                    largest_size = hole_size;
-                    largest_middle = h;
-                }
-            }
-            
-            if (largest_middle >= 0) {
-                selected_hole = largest_middle;
-                hole_type = "MIDDLE";
-                warn_report("acpi/mmio64: phase2 bus [%02x] selected largest MIDDLE hole %d (size=0x%"PRIx64")",
-                            pci_bus_num(this_bus), selected_hole, largest_size);
-            }
-        }
-        
-        /* 2. Try rightmost hole (after last anchor) */
-        if (selected_hole < 0 && cat.rightmost_hole >= 0) {
-            AddressInterval *hole = &g_array_index(holes, AddressInterval, cat.rightmost_hole);
-            uint64_t hole_size = hole->end - hole->start + 1;
-            
-            if (hole_size >= remaining_demand) {
-                selected_hole = cat.rightmost_hole;
-                hole_type = "RIGHT";
-                warn_report("acpi/mmio64: phase2 bus [%02x] selected RIGHTMOST hole %d (size=0x%"PRIx64")",
-                            pci_bus_num(this_bus), selected_hole, hole_size);
-            }
-        }
-        
-        /* 3. Try leftmost hole (before first anchor) as last resort */
-        if (selected_hole < 0 && cat.leftmost_hole >= 0) {
-            AddressInterval *hole = &g_array_index(holes, AddressInterval, cat.leftmost_hole);
-            uint64_t hole_size = hole->end - hole->start + 1;
-            
-            if (hole_size >= remaining_demand) {
-                selected_hole = cat.leftmost_hole;
-                hole_type = "LEFT";
-                warn_report("acpi/mmio64: phase2 bus [%02x] selected LEFTMOST hole %d (size=0x%"PRIx64")",
-                            pci_bus_num(this_bus), selected_hole, hole_size);
-            }
-        }
-        
-        g_array_free(cat.middle_holes, true);
-        
-        if (selected_hole < 0) {
-            error_report("acpi/mmio64: phase2 bus [%02x] insufficient contiguous space for "
-                         "remaining_demand=0x%"PRIx64,
-                         pci_bus_num(this_bus), remaining_demand);
-            g_array_free(holes, true);
-            g_array_free(fixed_bars, true);
-            g_array_free(remaining_bars, true);
-            exit(1);
-        }
-        
-        /* Pack in selected hole */
-        AddressInterval *selected = &g_array_index(holes, AddressInterval, selected_hole);
-        pack_start = selected->start;
-        pack_end = selected->end;
-        
-        warn_report("acpi/mmio64: phase2 bus [%02x] packing %s in hole %d: [0x%"PRIx64"..0x%"PRIx64"]",
-                    pci_bus_num(this_bus), hole_type, selected_hole, pack_start, pack_end);
-        
-        g_array_free(holes, true);
-        
-        /* Pack and program BARs (largest first) */
-        uint64_t bus_min_addr, bus_max_addr;
-        if (!pack_bars_into_region(remaining_bars, pack_start, pack_end, cfg,
-                                    &bus_min_addr, &bus_max_addr)) {
-            error_report("acpi/mmio64: phase2 bus [%02x] failed to pack BARs",
-                         pci_bus_num(this_bus));
-            g_array_free(fixed_bars, true);
-            g_array_free(remaining_bars, true);
-            exit(1);
-        }
-        
-        /* Include fixed BARs in bridge window calculation */
-        for (guint i = 0; i < fixed_bars->len; i++) {
-            AddressInterval *fixed = &g_array_index(fixed_bars, AddressInterval, i);
-            bus_min_addr = MIN(bus_min_addr, fixed->start);
-            bus_max_addr = MAX(bus_max_addr, fixed->end);
-        }
-        
-        /* Finalize bridge window */
-        finalize_bridge_window(this_bus, bus_min_addr, bus_max_addr, "phase2");
-        
-        g_array_free(fixed_bars, true);
-        g_array_free(remaining_bars, true);
-        break;
-    }
+    case PCI_PHASE_PACK_BARS_FOR_FIXED_BAR_DEVICES:
+        /* Phase 2 is handled once per bus by pci_bus_phase2_pack_remaining_bars */
+        return;
     case PCI_PHASE_PACK_BARS_FOR_NON_FIXED_DEVICES:
         /* Phase 3: TODO - implement later */
         break;
@@ -1026,13 +1323,11 @@ void pci_fixed_bar_allocator(struct GPEXConfig *cfg, VirtMachineState *vms)
         };
         pci_for_each_bus(bus, pci_bus_program_bars_phase, &pctx);
 
-        /* Phase 2: pack remaining bars for devices that had fixed BARs */
-        pctx.phase = PCI_PHASE_PACK_BARS_FOR_FIXED_BAR_DEVICES;
-        pci_for_each_bus(bus, pci_bus_program_bars_phase, &pctx);
+        /* Phase 2: pack remaining BARs once per bus that has at least one fixed-BAR device */
+        pci_for_each_bus(bus, pci_bus_phase2_pack_remaining_bars, &pctx);
 
-        /* Phase 3: pack bars for devices with no pci-boot-config */
-        pctx.phase = PCI_PHASE_PACK_BARS_FOR_NON_FIXED_DEVICES;
-        pci_for_each_bus(bus, pci_bus_program_bars_phase, &pctx);
+        /* Phase 3: allocate BARs for buses that have no fixed-BAR devices */
+        pci_for_each_bus(bus, pci_bus_phase3_allocate_no_fixed_bars, &pctx);
 
         g_hash_table_destroy(pctx.had_fixed);
     }
