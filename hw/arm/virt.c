@@ -1714,6 +1714,11 @@ static void create_pcie(VirtMachineState *vms)
     qemu_fdt_setprop_cell(ms->fdt, nodename, "#interrupt-cells", 1);
     create_pcie_irq_map(ms, vms->gic_phandle, irq, nodename);
 
+    if (vms->pci_pre_enum) {
+        qemu_fdt_setprop_cell(ms->fdt, nodename, "pci-enum-done", 1);
+        warn_report("virt: FDT pci-enum-done set (pci_pre_enum)");
+    }
+
     if (vms->iommu) {
         vms->iommu_phandle = qemu_fdt_alloc_phandle(ms->fdt);
 
